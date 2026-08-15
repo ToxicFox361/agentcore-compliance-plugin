@@ -33,10 +33,64 @@ QUEUE_URL = os.environ["USAGE_QUEUE_URL"]
 SYSTEM_PROMPT = os.environ["SYSTEM_PROMPT"]
 GATEWAY_URL = os.environ["GATEWAY_URL"]        # AgentCore Gateway MCP endpoint
 
+# ── Inference parameters: state them, never inherit them ─────────────────────
+#
+# Bedrock's InferenceConfiguration has exactly four members — maxTokens,
+# stopSequences, temperature and topP. Anything else a model supports (top_k
+# among them) travels in additionalModelRequestFields instead. Strands builds
+# inferenceConfig from a comprehension that drops every key whose value is
+# None, so a parameter left unset is not sent as some neutral value: it is not
+# sent at all, and the vendor's own default applies. That default is
+# model-specific, which makes a model-ID swap a change to sampling behaviour as
+# well as to prompt behaviour — the same failure family as §16 and §17 (§24).
+#
 # Quota is reserved per request as input_tokens + max_tokens. Unset means the
 # model's maximum — tens of thousands of tokens — so you throttle at a fraction
 # of real capacity. Size to the expected response (§8).
 MAX_TOKENS = 2048
+
+# Temperature 0 is greedy decoding. It is NOT a reproducibility guarantee:
+# InferenceConfiguration has no seed member, so nothing is held fixed between
+# runs and an identical request can still come back different. It narrows
+# variance; it does not make a run replayable. Reconstructing a compliance
+# decision therefore rests on the audit record — inputs, model ID and the
+# parameters below — plus the deterministic validation that runs after
+# generation (examples/output_validation.py), never on the model repeating
+# itself. Claiming determinism you do not have is worse than admitting the
+# gap, because the control everyone believes is present is not.
+TEMPERATURE = 0.0
+
+# Set temperature OR topP, not both: they truncate the same distribution and
+# interact unhelpfully. AWS documents this for Anthropic models on Bedrock
+# ("modify either temperature or top_p. Do not modify both at the same time"),
+# and Claude Sonnet 4.5 / Haiku 4.5 reject both being specified at once.
+#
+# Left None deliberately, which is not the same as forgetting it: topP then
+# resolves to this model's default. Pinning MODEL_ID on the record is what
+# makes that unset half determinate — which is why the two are recorded
+# together below.
+TOP_P = None
+
+# Part of the output contract rather than a formatting detail — an empty list
+# is a stated choice, and it is sent as such rather than dropped.
+STOP_SEQUENCES: list[str] = []
+
+# Exactly what goes on the wire, mirroring the framework's own drop-if-None
+# rule, so the decision record states what was sent rather than what was
+# intended. Anything absent here was chosen by the vendor, not by us (§24).
+# Note `is not None` rather than a truthiness test: temperature 0.0 is falsy,
+# and a truthy filter would silently drop the setting most likely to be chosen
+# deliberately — from the request as well as from the record.
+INFERENCE_PARAMETERS = {
+    key: value
+    for key, value in (
+        ("maxTokens", MAX_TOKENS),
+        ("temperature", TEMPERATURE),
+        ("topP", TOP_P),
+        ("stopSequences", STOP_SEQUENCES),
+    )
+    if value is not None
+}
 
 # Callers typically sit behind an API Gateway REST integration, which times out
 # at a hard 29s. Default Bedrock retry policy can spend minutes on a retryable
@@ -250,6 +304,10 @@ def build_agent(tools: list | None = None) -> Agent:
         model=BedrockModel(
             model_id=MODEL_ID,
             max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE,
+            top_p=TOP_P,               # None: dropped from inferenceConfig, by
+                                       # decision rather than by omission (§24)
+            stop_sequences=STOP_SEQUENCES,
             boto_client_config=BEDROCK_CLIENT_CONFIG,
         ),
         system_prompt=SYSTEM_PROMPT,
@@ -356,6 +414,10 @@ def invoke(payload, context):
         "request_id": request_id,
         "model_id": MODEL_ID,   # pinned on the record: a decision under one
                                 # model is not evidence about another
+        # Pinned for the same reason, and because there is no seed to fall back
+        # on: the reconstruction of this decision is the record — inputs, model
+        # and settings — not the hope that a re-run reproduces it (§24).
+        "inference_parameters": INFERENCE_PARAMETERS,
     }
 
 

@@ -16,7 +16,7 @@ the end and follow the section it names. If you arrive with a topic:
 | IAM and account setup | §1 inference-profile ARNs · §2 service-linked roles · §6 log permissions · §10 zero quota on new accounts |
 | Runtime lifecycle and deployment | §3 module-level agent object · §4 persist before verify · §5 placeholder substitution · §12 CDK region · §14 concurrent CDK |
 | Requests, quotas and timeouts | §7 session IDs · §8 max output tokens · §11 fail inside the caller's window |
-| Models and prompts | §15 streaming tool use · §16 vendor-coupled prompts · §17 capability tiers |
+| Models and prompts | §15 streaming tool use · §16 vendor-coupled prompts · §17 capability tiers · §24 inference parameters |
 | Cost | §9 regional pricing · §13 surfacing computed cost |
 | Tools, writes and authorization | §18 narrated actions · §19 tool namespacing · §20 placeholder tool errors · §21 prompts are not access control · §22 duplicate write paths · §23 policies that never match |
 
@@ -762,6 +762,80 @@ Sources:
 
 ---
 
+## 24. An unset inference parameter is a model default, not a neutral one
+
+**Symptom:** a workflow that was stable becomes erratic after a model-ID change nobody
+classified as a behaviour change — wider run-to-run variation, occasionally a different
+verdict on an identical alert — with no diff in the prompt, the tools or the schema. Or no
+symptom at all, until someone asks which settings produced a decision on file and the record
+cannot say.
+
+Bedrock's `InferenceConfiguration` carries exactly four members: `maxTokens`, `stopSequences`,
+`temperature` and `topP`. Anything else a model supports — `top_k` among them — travels in
+`additionalModelRequestFields`, not here. For `temperature` and `topP` the API reference says
+what it says for `maxTokens` in §8: *"The default value is the default value for the model
+that you are using."*
+
+Frameworks make the omission invisible. Strands' `BedrockModel` assembles `inferenceConfig`
+from a comprehension that drops every key whose value is `None`:
+
+```python
+"inferenceConfig": {
+    key: value
+    for key, value in [
+        ("maxTokens", self.config.get("max_tokens")),
+        ("temperature", self.config.get("temperature")),
+        ("topP", self.config.get("top_p")),
+        ("stopSequences", self.config.get("stop_sequences")),
+    ]
+    if value is not None
+},
+```
+
+A parameter you never set is therefore not sent as a neutral value — it is not sent at all,
+and the vendor's default applies. **That makes a model-ID swap a change to sampling behaviour
+as well as to prompt behaviour.** Same failure family as §16 and §17: the model ID looks like
+one decision and is in fact several, only one of which anyone re-tests.
+
+**Temperature 0 is greedy decoding, not reproducibility.** `InferenceConfiguration` has no
+`seed` member, so there is nothing to hold fixed across runs. Temperature 0 pushes the model
+toward the highest-probability continuation at each step, which narrows variance
+considerably — it does not make a run replayable, and an identical request can still return a
+different response. The distinction matters more here than in most domains: writing "set
+temperature 0 for auditability" into a design document manufactures a determinism guarantee
+the platform does not offer, and a control everyone believes is present is worse than an
+acknowledged gap. Reconstructing a compliance decision rests on the audit record — inputs,
+model ID, and the parameters actually sent — and on the deterministic post-generation layer
+(`guardrails.md` Layer 5), never on the model repeating itself.
+
+Set `temperature` **or** `topP`, not both. They truncate the same distribution and interact
+unhelpfully. AWS documents this for Anthropic models on Bedrock — *"When adjusting sampling
+parameters, modify either `temperature` or `top_p`. Do not modify both at the same time"* —
+and for Claude Sonnet 4.5 and Haiku 4.5 it is an API restriction rather than advice. Across
+vendors generally it is standard practice rather than a documented rule. Note the
+consequence: whichever axis you leave unset resolves to the vendor's default, so pinning the
+model ID is what makes the unset half determinate — another reason the two belong on the
+record together.
+
+**Rule: state `maxTokens`, `temperature` (or `topP`) and `stopSequences` explicitly, pin them
+per workflow, and record the set actually sent alongside the model ID on every decision
+record.** A drafting workflow and a classification workflow have no reason to share sampling
+settings, and "whatever the model does by default" is not a setting anyone chose.
+
+**Diagnostic:** log the resolved `inferenceConfig` — what went on the wire, not what the
+config object intended — and assert the keys you expect are present. A parameter absent from
+the request is a parameter the vendor chose. To size the variance you are actually carrying,
+run one ambiguous golden fixture repeatedly at the configured settings and record the spread;
+that number, rather than an assumption of determinism, is what an evaluation is measuring
+against.
+
+Sources:
+[InferenceConfiguration](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InferenceConfiguration.html),
+[Influence response generation with inference parameters](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-parameters.html),
+[Anthropic Claude Messages API request and response](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages-request-response.html).
+
+---
+
 ## Diagnostic quick reference
 
 | Symptom | Look at first |
@@ -789,6 +863,8 @@ Sources:
 | Two records per run, different IDs | Model and deterministic layer both writing (§22) |
 | `-32002 Tool Execution Denied ... policy enforcement` | A policy matched and denied; the policy ID names it (§23) |
 | Request above a policy threshold still succeeds | Cedar condition never matched — `ACTIVE` + `ENFORCE` is not proof (§23) |
+| Output varies run to run on an identical request | Sampling parameters unset, or expected to be deterministic — there is no seed (§24) |
+| Behaviour changed after a model-ID swap, prompt unchanged | The new model's default sampling regime applied (§24, with §16 and §17) |
 
 ---
 

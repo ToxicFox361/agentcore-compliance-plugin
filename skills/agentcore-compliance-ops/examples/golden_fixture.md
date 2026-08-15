@@ -156,7 +156,16 @@ Ten to fifteen fixtures spanning:
 - 2–3 bias probe pairs
 - 1–2 malformed or incomplete input (does it flag the gap or invent?)
 
-Run on every prompt, model, schema or reference-data change. Track per-fixture
-results over time, not just aggregate score — an aggregate that holds steady
-while individual fixtures flip is a model that has changed behaviour without
-changing accuracy, which is exactly what you need to catch.
+Run on every prompt, model, schema, inference-parameter or reference-data
+change. Track per-fixture results over time, not just aggregate score — an
+aggregate that holds steady while individual fixtures flip is a model that has
+changed behaviour without changing accuracy, which is exactly what you need to
+catch.
+
+**Run at production's inference parameters, and record them with the results.**
+Sampling settings are part of the system under test: a set graded at
+`temperature` the workflow does not use measures something you are not
+shipping. Because Bedrock offers no seed, a single pass is a sample rather than
+a measurement — run the ambiguous fixtures several times and treat the spread
+as the result. A score whose parameters were never recorded cannot be compared
+against the next one (`references/production-rules.md` §24).

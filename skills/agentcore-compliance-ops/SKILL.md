@@ -49,10 +49,19 @@ property of the *serverless*
 compute type; the Instances compute type runs agents on EC2 in your own account and agents sharing
 an instance are not isolated from each other, so confirm which one you are on before relying on it.
 
-**Set max output tokens explicitly, and never hardcode model pricing.** Quota is reserved as
-`input_tokens + max_tokens`; unset means the model's maximum, and you throttle at a fraction of
-apparent capacity. Rates are regional and published figures are almost always `us-east-1` — query
-the Price List API for the deployment region and record the model ID on every usage event.
+**Set inference parameters explicitly; an unset one is the model's default, not a neutral one.**
+`InferenceConfiguration` carries four members — `maxTokens`, `stopSequences`, `temperature`,
+`topP` — and frameworks drop the ones you leave unset, so the vendor's default applies and a
+model-ID swap silently changes sampling behaviour alongside prompt behaviour. Unset `maxTokens`
+also over-reserves quota (`input_tokens + max_tokens`), throttling you at a fraction of apparent
+capacity. There is no seed: **temperature 0 is greedy decoding, not a replayable run.** Pin the
+parameters per workflow and record them with the model ID on the decision record —
+reconstructability comes from the record and the deterministic post-generation layer, never from
+expecting the model to repeat itself. `references/production-rules.md` §8 and §24.
+
+**Never hardcode model pricing.** Rates are regional and published figures are almost always
+`us-east-1` — query the Price List API for the deployment region and record the model ID on every
+usage event.
 
 ---
 
@@ -75,7 +84,7 @@ the comment before removing one.
 
 | File | What it gives you |
 |---|---|
-| `examples/agent_template.py` | Runtime entrypoint — per-request agent, tool-list filtering as the access control, `max_tokens`, fast-fail retries, errors as data, usage emission with model ID |
+| `examples/agent_template.py` | Runtime entrypoint — per-request agent, tool-list filtering as the access control, explicit inference parameters pinned on the record, fast-fail retries, errors as data, usage emission with model ID |
 | `examples/iam_policies.py` | CDK roles — dual inference-profile ARN shape, logs permissions, SLR grants, IAM-enforced actor isolation |
 | `examples/agent_runtime.tf` | Terraform runtime — model IAM scoped to approved models, private networking, remote state |
 | `examples/tenant_isolation.py` | Server-derived, tenant-namespaced session IDs; tenant resolved from the resource |

@@ -161,6 +161,7 @@ Store enough to reconstruct the decision exactly, months later:
 | Field | Why |
 |---|---|
 | Model ID **and** version | A decision under one model is not evidence about another |
+| Inference parameters as sent (`maxTokens`, `temperature` or `topP`, `stopSequences`) | The same model at different settings is a different system — and with no seed available, the record is the only reconstruction (`production-rules.md` §24) |
 | Prompt/template version | Prompts change; decisions must pin the one in force |
 | Full evidence set supplied | The reconstruction is meaningless without its inputs |
 | Raw model output | Before any post-processing |
@@ -222,5 +223,6 @@ built without one means rebuilding the control structure.
 | Semantic search over customer PII, early on | Unexplainable recall plus a leakage surface |
 | Fine-tuning typologies into weights | Destroys version pinning and explainability |
 | Confidence score as an approval gate | Confidence is not calibrated to correctness |
+| Temperature 0 treated as a reproducibility guarantee | Greedy decoding narrows variance; with no seed it does not replay a run |
 | One prompt for all typologies | Dilutes every one; miss rate is invisible |
 | Shipping without a golden set | No way to detect degradation until an examiner does |
