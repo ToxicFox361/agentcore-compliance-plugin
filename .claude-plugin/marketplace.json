@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agentcore-compliance-ops",
+  "description": "AI agents on Amazon Bedrock AgentCore for regulated compliance operations — architecture, guardrails, and a catalogue of production failure modes.",
+  "owner": {
+    "name": "LucasSmith"
+  },
+  "plugins": [
+    {
+      "name": "agentcore-compliance-ops",
+      "description": "Design, build, review and debug AgentCore agents for regulated financial-crime compliance work. Ships one skill, three specialist subagents, and a session hook that checks for an authoritative AWS documentation source.",
+      "source": "./",
+      "category": "development"
+    }
+  ]
+}

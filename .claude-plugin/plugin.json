@@ -1,0 +1,20 @@
+{
+  "name": "agentcore-compliance-ops",
+  "version": "1.0.0",
+  "description": "Design, build, review and debug AI agents on Amazon Bedrock AgentCore for regulated financial-crime compliance operations. Carries a production-rules catalogue of failure modes that fail silently or blame the wrong cause.",
+  "author": {
+    "name": "LucasSmith"
+  },
+  "license": "MIT",
+  "keywords": [
+    "bedrock",
+    "agentcore",
+    "aws",
+    "compliance",
+    "aml",
+    "financial-crime",
+    "agents",
+    "guardrails",
+    "cedar"
+  ]
+}
