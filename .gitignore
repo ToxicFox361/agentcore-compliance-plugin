@@ -4,4 +4,5 @@ __pycache__/
 .idea/
 .vscode/
 .agentbridge/
+.serena/
 .claude/settings.local.json
