@@ -165,15 +165,76 @@ Store enough to reconstruct the decision exactly, months later:
 | Prompt/template version | Prompts change; decisions must pin the one in force |
 | Full evidence set supplied | The reconstruction is meaningless without its inputs |
 | Raw model output | Before any post-processing |
+| Reasoning trace, where the model emits one | The first thing an examiner asking *how was this concluded* wants to read — but see below |
 | Tool calls made, with results | What the run actually did, as distinct from what it narrated |
 | Validation result | Which checks ran, what passed |
 | Reference-data version | Which typology definitions applied |
 | Human decision, actor, timestamp | The decision of record |
 | Disagreement rationale, when overridden | Quality signal and examiner evidence |
 
+**A reasoning trace is testimony, not causation.** The model's reasoning text is a distinct artefact
+from its answer and worth persisting on its own. But it is model-generated narration of a process,
+not a verified causal account of one: it can be post-hoc rationalisation that does not reflect what
+actually drove the output. That is the same epistemics as an agent reporting an action it never took
+(`production-rules.md` §18) — plausible prose is not evidence of the thing it describes. Record it
+as evidence of *what the model said its reasoning was*, never as proof of why the output occurred.
+The consequence for control design: **a reasoning trace discharges neither citation grounding nor
+action grounding** (Layer 5). Claims still verify against the supplied evidence set, actions still
+verify against tool results and in-window invocation counts, no matter how convincingly the trace
+accounts for them. Traces are also bulky and carry PII verbatim — keep the text in the immutable
+object store and the content hash in the structured row (see the storage split below).
+
 Persist to an append-only store. Compliance audit trails should be tamper-evident — a database
 trigger rejecting `UPDATE`/`DELETE` for every role is stronger than a revoked grant, because a
 future migration can silently re-add a grant but cannot silently remove a trigger.
+
+### Case-level records for multi-agent workflows
+
+A per-invocation record is necessary and not sufficient. Where several specialists run concurrently
+on one subject — network and link analysis, customer history, document parsing, OSINT — a
+synthesiser writes the case up, and a QA agent verifies that write-up against the data, the
+examinable unit is the **case**, not any single invocation.
+
+- **Parent record over child records.** One case-level record aggregating N specialist runs, each
+  child keeping its own per-invocation record from the table above. The join key is the trace ID.
+- **Propagate W3C Trace Context across every agent boundary** — this is what makes the hierarchy
+  real rather than nominal. Propagated, a request through five agents is one trace with five spans;
+  unpropagated it is five disconnected traces, and correlation degrades to matching timestamps,
+  which produces wrong answers exactly when concurrent requests overlap — the normal condition for
+  a fan-out. AWS states this directly:
+  [AGENTOPS05-BP01](https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/agentops05-bp01.html).
+- **Per-fact attribution.** Every fact reaching the synthesiser carries four things: which
+  specialist asserted it, the tool result or source it came from, the confidence, and the retrieval
+  timestamp. Without it the synthesiser can silently manufacture a link between two specialists'
+  outputs that neither asserted, and the QA agent has nothing to check against — it can only re-read
+  the prose. Per-fact attribution is what makes Layer 5 citation grounding hold across a multi-agent
+  merge rather than only within one invocation.
+- **A partial evidence set is recorded as partial.** The case record states which specialists ran,
+  which failed, and that the synthesis was over an incomplete set. A synthesis over three of four
+  specialists presented as complete is the same failure class as the sweep that quietly covered 94%
+  of the portfolio (`architecture-patterns.md` pattern 6) — a compliance failure that looks like a
+  success.
+- **Split the storage by shape.** Structured, queryable rows go to a relational store with a
+  `BEFORE UPDATE OR DELETE` trigger that raises, for the reason given above. The bulky immutable
+  bundle — raw specialist outputs, reasoning traces, any captured screenshots — goes to **S3 Object
+  Lock in compliance mode**, which is WORM: a protected object version cannot be overwritten or
+  deleted before its retention expires by any user including the account root, and the retention
+  period cannot be shortened (it needs versioning enabled, and a simple `DELETE` still writes a
+  delete marker over an intact protected version). Record a content hash of each bundle object in
+  the structured row, so the pair is verifiable and neither half can be swapped unnoticed. DynamoDB
+  can approximate append-only with an IAM deny on `UpdateItem`/`DeleteItem` plus CloudTrail data
+  events, but it is the weaker form: no triggers, so the control lives entirely in policy that a
+  later change can re-grant. AWS recommends the same split — Object Lock in compliance mode for
+  compliance-critical records, tiered retention rather than one policy, and PII redacted *before*
+  write, naming PII inside reasoning traces as an anti-pattern outright:
+  [AGENTOPS05-BP03](https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/agentops05-bp03.html).
+
+The OTEL trace store cannot be the case record, for a reason beyond the retention and schema
+arguments in `deployment-patterns.md` (observability as audit evidence): AWS's own guidance
+recommends **sampling** — 100% of error traces plus a configurable percentage of successful ones —
+and separate retention tiers for operational, compliance and debug telemetry
+([AGENTOPS05-BP01](https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/agentops05-bp01.html)).
+Sampled telemetry is not an audit trail.
 
 ---
 
@@ -218,6 +279,9 @@ built without one means rebuilding the control structure.
 | Agent writes directly to the case record | No separation between proposal and decision |
 | Failed tool call returned as a placeholder value | A failure that reads like data ships silently |
 | Agent narrative accepted as evidence of an action | Verify the record *and* the in-window invocation count |
+| Reasoning trace treated as proof of why an output occurred | It is the model's account of its reasoning, not a causal record |
+| Multi-agent synthesis with no per-fact attribution | The synthesiser can assert a link no specialist made, and the verifier cannot catch it |
+| Partial specialist set synthesised as if complete | An incomplete evidence base presented as a finished case |
 | Policy assumed effective because it deployed | Loaded and enforcing is not the same as matching — test both directions |
 | Self-review ("check your work") | Produces agreement, not review — use a separate adversarial invocation |
 | Semantic search over customer PII, early on | Unexplainable recall plus a leakage surface |

@@ -19,6 +19,7 @@ the end and follow the section it names. If you arrive with a topic:
 | Models and prompts | §15 streaming tool use · §16 vendor-coupled prompts · §17 capability tiers · §24 inference parameters |
 | Cost | §9 regional pricing · §13 surfacing computed cost |
 | Tools, writes and authorization | §18 narrated actions · §19 tool namespacing · §20 placeholder tool errors · §21 prompts are not access control · §22 duplicate write paths · §23 policies that never match |
+| Multi-agent workflows | §25 partial evidence sets in a synthesis |
 
 ---
 
@@ -836,6 +837,49 @@ Sources:
 
 ---
 
+## 25. A synthesiser cannot tell a short evidence set from a complete one
+
+**Symptom:** a case write-up reads as complete, well-sourced and confident. One specialist in the
+fan-out failed, its findings are simply absent, and nothing in the output says so. Or a fact in the
+narrative turns out, on challenge, to trace back to no specialist at all.
+
+The fan-out shape is right: one task per specialist, gathered with `return_exceptions=True`
+(`architecture-patterns.md` pattern 6), so a failed OSINT lookup does not fail the case. But it
+returns exceptions *as values*, and unless the contract downstream forces the distinction, the
+synthesiser receives a list it has no way to read as short. "OSINT found nothing" and "OSINT never
+ran" arrive as the same input. Absence is not a token the model sees, and a model asked to
+synthesise the available material will synthesise the material available.
+
+The merge is also where a fact can acquire an author it never had. Two specialists' outputs sit in
+one context window, and a plausible link between them is exactly the kind of sentence a model
+writes down. Without per-fact attribution — asserting specialist, source tool result, confidence,
+retrieval timestamp — nothing distinguishes an asserted link from a manufactured one, and a QA or
+verifier agent has only the prose to re-read.
+
+**Why it hides:** every child record is correct. The specialist that failed recorded its failure;
+the ones that ran recorded valid runs. The defect exists only at the case level — which is the
+level nobody persisted (`guardrails.md`, case-level records for multi-agent workflows). It also
+inverts the blame: the finished narrative looks like synthesiser hallucination, so the
+investigation goes at the synthesiser's prompt and its temperature, when the cause is an input set
+that was three of four.
+
+**Rule: a synthesis step consumes an explicit manifest, not a list of results** — which specialists
+were dispatched, which returned, which failed — **and every fact carries its attribution.** A case
+whose evidence set was incomplete is recorded as incomplete, and that is a finding about the case,
+not an operational detail to be tidied away.
+
+**Diagnostic:** compare the specialists the case record claims against the specialists that
+actually emitted spans under the case's trace ID — which requires W3C Trace Context propagated
+across every agent boundary, or there is nothing to join on and correlation falls back to
+timestamps. Then assert that every fact in the write-up resolves to an attribution entry, and fail
+the *case* rather than the fact when one does not. As in §18, the narrative is not the evidence.
+
+Sources:
+[AGENTOPS05-BP01 Establish end-to-end tracing and telemetry for agent operations](https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/agentops05-bp01.html),
+[AGENTOPS05-BP03 Implement structured logging and comprehensive audit trails](https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/agentops05-bp03.html).
+
+---
+
 ## Diagnostic quick reference
 
 | Symptom | Look at first |
@@ -865,6 +909,8 @@ Sources:
 | Request above a policy threshold still succeeds | Cedar condition never matched — `ACTIVE` + `ENFORCE` is not proof (§23) |
 | Output varies run to run on an identical request | Sampling parameters unset, or expected to be deterministic — there is no seed (§24) |
 | Behaviour changed after a model-ID swap, prompt unchanged | The new model's default sampling regime applied (§24, with §16 and §17) |
+| Case write-up reads complete, but a specialist never ran | Synthesis over a partial fan-out with no manifest (§25) |
+| A fact in a synthesis traces back to no specialist | Merge step with no per-fact attribution (§25) |
 
 ---
 
