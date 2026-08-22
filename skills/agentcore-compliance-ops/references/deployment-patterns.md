@@ -13,8 +13,9 @@ and the account itself.
 | Section | Answers |
 |---|---|
 | [The core rule for data access](#the-core-rule-for-data-access) | How agents reach tenant data; which Gateway target type to pick |
-| [Hosting: Harness or Runtime](#hosting-harness-or-runtime) | Which to choose; the Runtime contract; container vs direct code deployment |
-| [Session and tenant binding](#session-and-tenant-binding) | Who owns the session-to-tenant mapping, and session lifecycle |
+| [Hosting: Harness or Runtime](#hosting-harness-or-runtime) | Which to choose; the Runtime and protocol contracts; container vs direct code deployment; the endpoint step |
+| [What Harness moves into the request](#what-harness-moves-into-the-request) | Which controls become caller-supplied on Harness, and what your backend must strip |
+| [Session and tenant binding](#session-and-tenant-binding) | Who owns the session-to-tenant mapping, session lifecycle, and what persists |
 | [Close the Gateway bypass](#close-the-gateway-bypass) | Stopping direct Runtime invocation; command-execution APIs; payload validation |
 | [Credentials](#credentials) | Token Vault, user-delegated vs autonomous, identity propagation via interceptors |
 | [Policy as a deterministic control](#policy-as-a-deterministic-control) | Cedar controls that survive prompt injection — and proving they work |
@@ -23,9 +24,10 @@ and the account itself.
 | [Evaluations](#evaluations) | Built-in, LLM-as-judge and code-based evaluators |
 | [Deployment topology](#deployment-topology) | Accounts, Regions, environments, per-tenant vs shared |
 | [Infrastructure as code](#infrastructure-as-code) | Current CDK surface and packaging choices — see `iac-hardening.md` for the full audit |
-| [Limits that shape design](#limits-that-shape-design) | Quotas worth designing around, and the `/ping` trap |
+| [Limits that shape design](#limits-that-shape-design) | Quotas worth designing around, the `/ping` trap, retry policy per path |
+| [Prompt caching](#prompt-caching) | Why a compliance prompt caches unusually well, and how it fails silently |
 | [MMDSv2 enforcement](#mmdsv2-enforcement) | Now in effect — what to assert |
-| [Post-deploy verification](#post-deploy-verification) | Why `READY`/`ENFORCE` proves nothing, and what to check instead |
+| [Post-deploy verification](#post-deploy-verification) | Why `READY`/`ENFORCE` proves nothing, real Gateway target states, and what to check instead |
 | [Recommended starting architecture](#recommended-starting-architecture) | The whole thing on one page |
 
 ---
@@ -107,6 +109,11 @@ custom control flow — supervisor/specialist routing (§10), or pre/post-proces
 Note that "graph/workflow style, non-agent-loop patterns" is an explicit ❌ for Harness, so a
 LangGraph-style state machine forces Runtime.
 
+That recommendation comes with a condition, and it is not optional: what Harness turns into config,
+`InvokeHarness` also lets a caller override per request. Read
+[What Harness moves into the request](#what-harness-moves-into-the-request) before exposing a harness
+to anything but your own backend — four of this skill's controls depend on what that backend strips.
+
 Three of the defects catalogued in `production-rules.md` — the module-level agent object (§3),
 unset max output tokens (§8), and placeholder substitution (§5) — are "you own the loop" defects
 that a managed loop cannot have. Weigh that. Harness's `maxTokens` and `maxIterations` are the
@@ -116,8 +123,28 @@ config-level answer to §8 and to runaway loops; see
 **Runtime contract if you do own the loop** — from the
 [HTTP protocol contract](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-http-protocol-contract.html):
 ARM64 container, host `0.0.0.0`, port **8080**, `POST /invocations` (JSON or SSE), `GET /ping`,
-and an optional `/ws` for bidirectional streaming. MCP and A2A are separate protocol contracts
-with their own shapes.
+and an optional `/ws` for bidirectional streaming.
+
+**That is one of four contracts, and this file deliberately does not carry the other three.** AWS
+maintains protocol contracts for HTTP, MCP, A2A and AG-UI, and they differ in port, health-check
+path and — for A2A — an agent-card file the container must serve. The protocol has to be chosen
+**before the container is built**, because changing it means rebuilding and redeploying, which makes
+it a design decision rather than a configuration one. Take the current specification from the global
+`amazon-bedrock` skill or from AWS's protocol-contract pages rather than from anything written here.
+The reason for that instruction is concrete: AWS's own two pages currently disagree with each other
+on the HTTP health-check path, on three of the four ports, and on the A2A card filename. A skill
+carrying a copy would simply be wrong in a way nobody notices until a container fails its health
+check. The HTTP figures above match the runtime-level document — the likelier authority — and are
+what to build against for the workflows in this skill.
+
+**The data plane, for the backend that calls it.** The operation is `InvokeAgentRuntime`, the path is
+`POST /runtimes/{agentRuntimeArn}/invocations`, and the SigV4 signing service name is
+**`bedrock-agentcore`** — *not* `bedrock-agentcore-control`, which signs the control plane. Signing
+with the wrong service name produces a signature mismatch that reads like a credentials problem.
+Streaming is requested with `accept: text/event-stream` and confirmed by the agent answering
+`Content-Type: text/event-stream`. The session header is protocol-dependent, which catches people
+who move an existing client across protocols: `Mcp-Session-Id` for MCP, and
+`X-Amzn-Bedrock-AgentCore-Runtime-Session-Id` for HTTP, A2A and AG-UI.
 
 **Two ways to package it.** Container images are no longer the only option —
 [direct code deployment](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-get-started-code-deploy.html)
@@ -125,9 +152,131 @@ ships a zip to S3 with no Docker at all. The trade-off worth knowing for regulat
 patches what: with direct code deploy AWS patches the language runtime (but *not* past its end of
 support — see
 [supported language runtimes and deprecation policy](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-code-deploy-supported-runtimes.html)),
-whereas with a container image rebuilding on a current base image is yours. Package size limits
-differ substantially between the two; check the quotas page before assuming your dependency tree
-fits.
+whereas with a container image rebuilding on a current base image is yours.
+
+Package size is the constraint that decides it for some dependency trees: a **container image is
+capped at 2 GB**, while **direct code deploy is capped at 250 MB compressed / 750 MB uncompressed**,
+and none of those three numbers is adjustable. A dependency tree that fits comfortably in a container
+will not always fit direct code deploy — an ML-heavy agent pulling a scientific stack is the usual
+casualty — so check your artifact size before committing to the packaging model, because switching
+later changes the build pipeline, the patching story and the IaC resource shape together.
+
+**Creating the runtime is not the last step — the endpoint is.** AWS's deployment procedure makes
+Runtime Endpoint creation an explicit step with its own readiness poll:
+[`CreateAgentRuntimeEndpoint`](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_CreateAgentRuntimeEndpoint.html),
+then `get-agent-runtime-endpoint` until it reports `READY`. The runtime is **not invocable until the
+endpoint is active**. A `DEFAULT` endpoint is created for you, and the visible evidence of it is the
+log group name — `/aws/bedrock-agentcore/runtimes/<agent_id>-<endpoint_name>` — but any *named*
+endpoint you rely on for version pinning is yours to create and yours to wait for. So poll the
+endpoint, not just the runtime: a runtime sitting at `READY` behind an endpoint that is not is
+exactly the failure shape the "persist before verify" rule (`production-rules.md` §4) exists to
+contain, because the deployment reads as finished and the first invocation does not work.
+
+---
+
+## What Harness moves into the request
+
+Defaulting to Harness moves a set of decisions out of your container and into the API call. That is
+the point of it. It also means **four claims made elsewhere in this skill stop holding the moment
+caller input reaches `InvokeHarness` unfiltered** — and because the whole appeal of Harness is that
+config changes need no redeploy, nothing about the deployment will look different when they stop
+holding.
+
+`InvokeHarness` can override the harness configuration **for a single call, without redeploying**.
+The overridable fields are `model`, `systemPrompt`, `tools`, `allowedTools`, `skills`,
+`maxIterations`, `maxTokens`, `timeoutSeconds` and `actorId`. In a multi-tenant compliance platform
+that list is an attack surface, and it is worth reading it as one:
+
+| Override | What it breaks |
+|---|---|
+| `tools` / `allowedTools` | "Enforce it in the tool list the model is offered, never in the prompt" (`control-stack.md`, `production-rules.md` §21) — the control this skill leans on hardest. On Harness the **caller** supplies the list, so a narrowed read-only tool surface becomes a default rather than a boundary. |
+| `skills` | Skills are fetched per session (AWS Skills, Git, Amazon S3, session filesystem) and injected as **trusted context including any scripts they carry**; an invoke-time skill with the same name overrides the harness default; and **there is no IAM condition key that can restrict this field**. This is arbitrary code arriving in the agent's context, not a tool call you can review or a policy you can write. |
+| `actorId` | Memory is scoped per actor. One backend service principal serving many analysts, plus a caller-chosen `actorId`, is one analyst reading another's long-term memory. This is the session-ID isolation problem (`production-rules.md` §7) arriving through Memory instead of through the session. |
+| `model` / `systemPrompt` | The model and prompt recorded on the decision record become caller-chosen, which undoes the reproducibility the record exists for. Worse, `model.additionalParams` is passed to the provider **unchanged**, so a LiteLLM `apiBase` can redirect the inference call to an endpoint you do not operate. |
+
+**The rule: your backend constructs the `InvokeHarness` request and *strips* every override field.**
+Strips, not validates. Start from a request you built and add back only what a caller has a stated
+reason to set; do not start from the caller's request and remove what looks dangerous. The
+difference is not stylistic — the field list grows, and a validating filter forwards the next field
+AWS adds while a stripping constructor does not. For `skills` in particular there is no other
+control available: no IAM condition key, no Cedar policy in that path, nothing at the Gateway. The
+application layer is the entire defence.
+
+**Execution limits are overrides too.** `maxIterations`, `maxTokens` and `timeoutSeconds` are the
+config-level answer to runaway loops and to the unset-max-output-tokens defect
+(`production-rules.md` §8) — and all three are in the overridable list. Set them explicitly on the
+harness *and* strip them from caller input, because a limit the caller can raise is a budget, not a
+limit.
+
+**Inbound auth is one method at a time, and the difference that matters is verification, not
+capability.** A harness accepts SigV4 when it has no `authorizerConfiguration` and OAuth JWT when it
+does. There is no mixed mode; it rejects the wrong credential type outright, and switching means a
+separate version per auth type rather than an in-place edit.
+
+Both paths can carry a per-user identity downstream: the user-ID header reaches
+`GetWorkloadAccessTokenForUserId` and the on-behalf-of token exchange on either. The decisive
+difference is that on the SigV4 path **the platform treats that user ID as an opaque string it does
+not verify** — nothing ties it to an authenticated end user, so a backend that forwards a
+client-supplied value has an audit trail naming whoever the client claimed to be. On the OAuth JWT
+path the identity is validated against the issuer, which is why AWS recommends JWT for production.
+
+So SigV4 is usable, conditionally: the user ID must be **derived server-side** from the authenticated
+session and never accepted from the request, exactly as session IDs are. If your backend cannot
+guarantee that, the identity on the record is decorative and JWT is the only honest option. Either
+way, monitor the token-exchange calls in CloudTrail — that is AWS's own compensating control, and it
+is what makes a forged user ID detectable rather than invisible.
+
+When you configure JWT, set `allowedAudience` and `allowedClients`: an authorizer with neither
+accepts any valid token from the issuer, including a token minted for a different service entirely.
+
+**VPC mode needs a NAT gateway, and the failure arrives late.** A VPC-mode harness pulls its
+container from **Amazon ECR Public** at the start of *every session*, and ECR Public has no VPC
+endpoint. VPC mode therefore requires a NAT gateway with a route to an internet gateway, or sessions
+fail at start with an image-pull timeout — *after* the harness has reported healthy. That is why this
+one surfaces as a mysterious invocation failure rather than a deployment failure, and why it is worth
+asserting in a pre-flight rather than diagnosing under pressure.
+
+**Harness IAM, including the grant everybody misses.** `InvokeHarness` needs **both**
+`bedrock-agentcore:InvokeHarness` and `bedrock-agentcore:InvokeAgentRuntime` — the harness call and
+the underlying runtime call are authorised separately. `CreateHarness` needs
+`bedrock-agentcore:CreateHarness` plus **`iam:PassRole`** for the execution role, plus
+`GetAgentRuntime`, `CreateAgentRuntime`, `GetMemory` and `CreateMemory`, because it creates those
+resources on your behalf. Omitting `iam:PassRole` is the most common cause of a `CreateHarness`
+`AccessDenied`, and the error message does not name it.
+
+**`harnessName` is capped at 40 characters** (letters, digits and underscores, starting with a
+letter). Worth stating plainly because the name-validation regex in `examples/agent_runtime.tf`
+allows 48 — correct for a runtime name, and wrong the moment somebody reuses it for a harness.
+
+**Harness inference config is a different shape from Bedrock's**, which catches people porting
+configuration across and changes how one of this skill's rules is implemented:
+
+```json
+{"model": {"bedrockModelConfig": {
+  "modelId": "<model-id>",
+  "maxTokens": 4096, "temperature": 0.7, "topP": 0.9,
+  "apiFormat": "converse_stream",
+  "additionalParams": {}
+}}}
+```
+
+Four differences from Bedrock's `InferenceConfiguration`: the union variant key is
+**`bedrockModelConfig`**, not a bare `bedrock`; the tuning parameters are **flat, with no
+`inferenceConfig` wrapper**; there is **no `stopSequences` member** in that shape; and
+`additionalParams` is the route for anything the shape does not name, including `top_k`. Note also
+that `systemPrompt` is a **list of content blocks**, not a string.
+
+So the rule about recording the parameters actually sent has a different worked form here. On Harness
+the thing to persist is the **resolved** `bedrockModelConfig` and the **resolved** `systemPrompt`
+list — captured after your backend has applied its defaults and stripped the caller's overrides,
+because that, and not the harness configuration on file, is what the model actually ran under.
+
+Current field lists, provider variants and the security model are in the global `amazon-bedrock`
+skill (`amazon-bedrock/references/agentcore-harness.md`), the
+[CreateHarness](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_CreateHarness.html)
+and [InvokeHarness](https://docs.aws.amazon.com/bedrock-agentcore/latest/APIReference/API_InvokeHarness.html)
+API references, and
+[Harness security and access controls](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html).
 
 ---
 
@@ -148,6 +297,17 @@ AgentCore isolates the **compute**; your backend owns the **authorization mappin
 to tenant and user. Derive session IDs server-side, namespaced by the tenant resolved from the
 resource record — see `production-rules.md` §7 for the implementation.
 
+**The session id does not travel by itself.** If the authorization mapping is enforced downstream —
+by a Gateway REQUEST interceptor looking the session up and injecting the resolved scope — note that
+the Gateway does **not** propagate the AgentCore runtime session id to that interceptor. The
+`gatewayRequest` it receives carries `headers`, `body`, `httpMethod`, `path` and a `context` holding
+only `identity`; there is no runtime session id in it and no `mcp-session-id` header. The agent has
+to send its own session id as a request header for the binding to be findable at all, which is safe
+for a specific reason and not in general: the header names a session, while the binding behind it
+stays server-written. See `production-rules.md` §30 for the header, the fail-closed conditions that
+make it safe, and the diagnostic.
+
+
 Same warning applies to the user-identity path: the
 `X-Amzn-Bedrock-AgentCore-Runtime-User-Id` header is treated as *an opaque string without IdP
 verification*. Docs recommend JWT-based identification in production, and explicitly denying
@@ -160,8 +320,27 @@ of a tenant leaks conversation state between analysts; sharing across tenants is
 Two mechanics that catch people out. `runtimeSessionId` has a **minimum length** (33 characters at
 last check — a UUID satisfies it), so a tenant-namespaced derivation scheme needs enough entropy to
 clear it. And sessions end on their own: idle timeout terminates the microVM, maximum lifetime caps
-it outright, and a request reusing the same ID afterwards silently gets a *new* execution
-environment rather than an error. Design for that — nothing in the session is durable. See
+it outright, and a request reusing the same ID afterwards silently gets a *new* execution environment
+rather than an error.
+
+**What survives that, and what does not.** In-memory state never survives. The replacement execution
+environment starts clean, so anything an agent stashed in a module-level variable or a process-local
+cache is gone — which is one more reason the module-level agent object (`production-rules.md` §3) is a
+defect rather than an optimisation. Filesystem state *can* survive, but only because you asked for
+it: configure **session storage** (`filesystemConfigurations` on the API,
+`session_storage { mount_path }` in Terraform) and data written under the mount path persists across
+stop and resume cycles, capped at **1 GB per session**. The session-state vocabulary explains the
+behaviour worth designing against — a session is **Active**, **Idle** or **Stopped**; a Stopped
+session returns to Active on the next invoke; and the session stays valid until the **runtime ARN
+itself is deleted**, not until some shorter clock expires.
+
+For a compliance platform this cuts both ways, and both directions need a decision. It is a
+legitimate persistence option for case work that spans an analyst's day without pushing intermediate
+state through Memory. It is also a **data-at-rest surface inside the session** — a place customer PII
+can accumulate outside your database, outside your retention schedule and outside your erasure
+tooling, in a location that the "nothing in the session is durable" mental model says cannot exist.
+If you enable session storage it joins the PII inventory, with an encryption and retention answer of
+its own; if you do not need it, leaving it unconfigured is the cheaper control. See
 [Use isolated sessions for agents](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-sessions.html).
 
 ### The Instances compute type breaks the one-microVM-per-session assumption
@@ -252,12 +431,41 @@ any caller-supplied message history. A guardrail that the request routes around 
 
 ## Credentials
 
-Outbound credentials live in AgentCore Identity's **Token Vault**, backed by a Secrets Manager
-secret in your account. You can bring your own secret (own KMS key, own rotation) — same Region
-only, no cross-Region references. See
+Outbound credentials live in AgentCore Identity's **Token Vault**, backed by a Secrets Manager secret
+in your account — same Region only, no cross-Region references. See
 [AgentCore Identity](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/identity.html)
 and
 [Understanding credentials management](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/security-credentials-management.html).
+
+**Who owns that secret depends on the provider type, and getting it wrong is expensive in a regulated
+shop.** For **API-key credential providers** the service creates, encrypts and stores the key in
+Secrets Manager *itself*: the create response hands back an `apiKeySecretArn`, you must **not** create
+the secret manually, and rotation goes through **`update-api-key-credential-provider`** — explicitly
+*not* `secretsmanager rotate-secret` against the service-managed secret, which is precisely the
+instrument a compliance function will reach for and which breaks the provider. OAuth credential
+providers follow the same service-managed pattern.
+
+The consequence to plan for: if your control set says "customer-managed KMS key and an automated
+rotation schedule on every secret" — and in a supervised environment it usually does — then Token
+Vault provider secrets need a documented exception, satisfied by *rotation through the AgentCore API*
+rather than by a Secrets Manager rotation schedule. Write that down before the control owner finds the
+secret in an inventory and configures rotation on it. **One claim here needs confirming rather than
+designing around:** whether any provider type genuinely accepts a bring-your-own secret with your own
+CMK and your own rotation. That claim circulates, this skill can no longer verify it, and the failure
+mode of assuming it is an unrotatable production credential — so treat it as unconfirmed and check the
+current API reference for the specific provider type you need.
+
+**Ordering is mandatory:** create the credential provider **before** the gateway target that uses it,
+or target creation fails with a "credential provider not found" error. This bites in IaC, where
+ordering is inferred from references — if the target does not reference the provider directly, declare
+the dependency explicitly rather than relying on luck in the graph.
+
+**And prefer not to reach for an API key at all.** AWS's own preference is the right one to adopt
+here: an API key is a long-lived credential, whereas IAM is ephemeral and auto-rotated, and OAuth
+carries the identity of a person. Use IAM where the target supports it, OAuth where the target
+supports it and a human is in the loop, and an API key only where neither is available — then treat it
+as the thing you have to justify in a control review, with the rotation path above named in the
+justification.
 
 At call time, Gateway obtains a workload access token bound to **agent workload identity + user
 ID**, then exchanges it for the actual credential. **The agent code never sees the raw
@@ -386,10 +594,13 @@ For a multi-tenant compliance platform:
   persist across sessions are an unversioned, unauditable influence on later decisions — hard to
   defend when an examiner asks why a decision was made.
 - Short-term (within-session) memory is uncontroversial and sufficient for most workflows here.
-- There are caps on memory resources per Region *and* on strategies per memory resource. The
-  per-resource strategy cap is the one that surprises people, because it constrains how many
-  distinct extraction behaviours one memory can carry. Check both on the quotas page before
-  designing a per-tenant or per-workflow memory layout.
+- **6 strategies per memory resource, and that cap is not adjustable** — the account-level ceiling is
+  900 strategies and that one is. The per-resource cap is the one that surprises people, because it
+  constrains how many distinct extraction behaviours a single memory can carry, and a memory
+  configured with semantic extraction, summarization, user preference and two custom strategies is
+  already at five. Memory resources per Region is a separate quota (150, adjustable — in the table
+  below). Design a per-tenant or per-workflow memory layout against the per-resource cap first, since
+  it is the one you cannot raise by asking.
 
 Long-term extraction is **asynchronous** — memories are not immediately retrievable after an event.
 Do not write a post-deploy check that asserts a memory is readable immediately after writing it;
@@ -400,19 +611,30 @@ it will be flaky for reasons that have nothing to do with your deployment.
 ## Observability as audit evidence
 
 Built on OpenTelemetry, surfaced in CloudWatch GenAI Observability: agent metrics, session views,
-and traces with per-span tool parameters, latency and token usage. Automatic when hosted on
-Runtime — no OTEL libraries to add. It does require a **one-time per-account** enablement of
+and traces with per-span tool parameters, latency and token usage. Runtime-hosted agents are
+auto-instrumented for those built-in spans. It does require a **one-time per-account** enablement of
 [CloudWatch Transaction Search](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Enable-TransactionSearch.html)
 before spans and traces are visible at all, which is the usual reason a correctly instrumented
 agent appears to emit nothing. Overview:
 [AgentCore Observability](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability.html);
 setup: [get started](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-get-started.html).
 
+**"Nothing to add" is true of the built-in spans and false of the two things you probably came for.**
+AgentCore **Evaluations** reads specific OTEL attributes — agent input, agent output, tool calls with
+their inputs and outputs, latency per step — and an evaluation configuration pointed at traces that do
+not carry them cannot work at all. The failure presents as an evaluation problem (empty results,
+nothing to score) rather than as the instrumentation problem it is. Token and GenAI usage metrics are
+not published automatically either, which matters for the per-tenant cost attribution this platform
+needs. Both require the **ADOT SDK in your agent code**, so budget for it during the build rather than
+discovering it when the first evaluation run comes back with nothing. That is not in tension with the
+point below that the ADOT *Collector* is unsupported — the SDK is a sanctioned path and the collector
+is not.
+
 Traces are operational telemetry — **not** a compliance audit record. Retention, schema and
-availability are not under your control. Persist your own decision record (see `guardrails.md`) to
+availability are not under your control. Persist your own decision record (see `control-stack.md`) to
 an append-only store. Use traces to debug; use your own records to answer examiners.
 
-Three things to get right in a regulated deployment:
+Five things to get right in a regulated deployment:
 
 - **Redirecting OTLP to a third-party backend is a move, not a copy.** Runtime-hosted agents are
   auto-instrumented to CloudWatch; pointing the exporter at a vendor is what stops traces arriving
@@ -429,13 +651,67 @@ Three things to get right in a regulated deployment:
   sensitive data out of observability attributes and payloads as a best practice; it is not on by
   default, and instrumenting redaction is
   [configuration you write](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html).
-- **CloudTrail does record the data plane — but only the call, not the content.** `InvokeAgentRuntime`,
-  `InvokeAgentRuntimeCommand`, `InvokeAgentRuntimeCommandShell` and the control-plane operations are
-  logged with caller identity, timestamp, source IP and response status. That answers *who invoked
-  which agent, when*. It does not answer *what they asked*, which lands in the agent's CloudWatch
-  log group. Correlate the two by request ID if you need the whole picture, and set metric filters
-  and alarms on the command-execution APIs. Do not assume either is enabled and retained to your
-  policy by default.
+- **The invoke APIs are CloudTrail *data* events, so by default they are not logged at all.**
+  `InvokeAgentRuntime`, `InvokeAgentRuntimeCommand` and `InvokeAgentRuntimeCommandShell` are recorded
+  as **data events** under `resources.type` `AWS::BedrockAgentCore::Runtime`. Trails do not record data
+  events unless you configure them to, and data events **never appear in Event History** — so a fresh
+  account has no record whatsoever of who invoked which agent, and the console offers no hint that
+  anything is missing. This is off, not merely unreliable. Turn it on explicitly:
+
+  ```bash
+  aws cloudtrail put-event-selectors --trail-name <trail> \
+    --advanced-event-selectors '[{
+      "Name": "AgentCore runtime data events",
+      "FieldSelectors": [
+        {"Field": "eventCategory", "Equals": ["Data"]},
+        {"Field": "resources.type", "Equals": ["AWS::BedrockAgentCore::Runtime"]}
+      ]
+    }]'
+  ```
+
+  `put-event-selectors` **replaces** the trail's selectors rather than appending to them, so read the
+  existing configuration first and re-send it alongside this one — otherwise turning agent logging on
+  turns something else off. Control-plane operations (`CreateAgentRuntime`, `UpdateAgentRuntime`,
+  `CreateHarness` and the rest) are management events and are logged by default. Set metric filters and
+  alarms on the two command-execution APIs; and do not assume anything is retained to your
+  record-keeping policy by default.
+- **What a data event proves — and the alarm that follows from it.** The event carries caller identity,
+  timestamp, source IP, response status **and the target `sessionId`, in the same record**. That
+  combination is worth more than an audit trail: because the authenticated principal and the session it
+  routed to appear together, a principal invoking a session that does not belong to it becomes a
+  *detectable event* rather than something you infer afterwards. In a platform where sessions are
+  server-derived and tenant-namespaced (`production-rules.md` §7), that is a concrete metric filter and
+  alarm on cross-principal session routing — the one signal that catches the session-isolation failure
+  this file keeps warning about *while it is happening*. It still does not answer *what they asked*,
+  which lands in the agent's CloudWatch log group; correlate by request ID for the whole picture.
+- **Bedrock model invocation logging is a fourth PII sink, and it is nobody's default.** Separate from
+  AgentCore observability, opt-in, off until somebody switches it on, it writes **complete prompts and
+  responses** to CloudWatch Logs and/or S3, with its own log group, its own retention setting and its
+  own KMS decision. Two consequences. First, it is what makes Guardrails PII masking irrelevant to your
+  log estate: masking shapes what the model and the user see, not what the invocation log captured on
+  the way through. Second, somebody will switch it on wanting an audit record of what the agent asked
+  the model — and it is the wrong instrument for that, plainly. It is service-managed, its retention
+  lives somewhere other than your record-keeping system, its schema is not a stable contract, it is not
+  tamper-evident, and it is a full-fidelity copy of every prompt including the PII the rest of this file
+  works to keep out of places you do not control. Build the audit record properly instead.
+
+  **Where the deployment policy is that the provider's logs hold usage telemetry only, this is not a
+  judgement call — it is off in production.** Same for AgentCore `APPLICATION_LOGS`, whose
+  `request_payload` and `response_payload` are unredacted; `USAGE_LOGS` is the signal that profile
+  wants. Both are genuinely useful in a development account against synthetic fixtures, which is where
+  the full-fidelity configuration belongs. And because invocation logging is account-and-Region-wide
+  with a single destination pair, one enable in a shared account defeats the policy for every workload
+  in it — which is the argument for separate accounts per environment with an SCP denying
+  `bedrock:PutModelInvocationLoggingConfiguration` in the production one (`Put` only, never `Delete`,
+  so remediation stays possible if a configuration ever exists), so the configuration cannot be created
+  rather than merely being absent. The vended-delivery half cannot be closed as cleanly: a blanket deny
+  on `logs:PutDeliverySource` would also block the `USAGE_LOGS` delivery this profile wants, and no
+  documented condition key distinguishes log type on that call — so scope those calls to a single
+  deployment role, pin the permitted log types in its IaC, and add a scheduled assertion over
+  `describe-deliveries`. That half is detective rather than preventive, and saying so is the point:
+  it is a further argument for the gate in front of the sink. `audit-trail.md` carries the profile
+  split and the per-rule verification; `examples/log_projection.py` carries the gate that decides what
+  may be emitted at all.
 
 Session correlation is available via OTel baggage (`session.id`) and framework trace attributes,
 so spans can be filtered per session — useful, but it is the floor, not an audit trail.
@@ -472,11 +748,36 @@ sampling live production traffic continuously. Where you have known-correct answ
 [ground-truth evaluation](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/ground-truth-evaluations.html)
 compares against them directly.
 
-Map this onto the monitoring in `guardrails.md`: on-demand runs against the golden set on every
+**The mapping worth writing down.** Which built-in evaluators exist will change; what they *mean* for a
+supervised compliance workflow does not, and two of them are simply the automated form of controls this
+skill already insists on:
+
+| Evaluator | What it automates |
+|---|---|
+| `Faithfulness`, `ContextRelevance` | **Citation grounding** — is every claim supported by retrieved material, and was the material retrieved actually relevant |
+| `ToolSelectionAccuracy`, `ToolParameterAccuracy` | **Action grounding** — did the run call the tool it should have, with the arguments it should have |
+| `Refusal`, `Stereotyping` | Complement the bias probes in `control-stack.md` |
+| `GoalSuccessRate`, `Coherence`, `Conciseness` | Least useful here — see below |
+
+That last row needs its reasoning stated, because the names sound like exactly what you want. A fluent,
+coherent, concise, **wrong** disposition is this domain's characteristic failure mode, and all three of
+those evaluators score it well. They are not harmful; they measure the dimension that was never at
+risk, and a dashboard of them reads as reassurance.
+
+**Evaluator `level` matters as much as evaluator choice.** Use `TOOL_CALL` level for action grounding
+and `SESSION` level for the case-level record. This is not a detail to tune later: a multi-specialist
+case (§10) is **one session containing several invocations**, so a `TRACE`-level evaluator cannot see
+the thing you need judged — it sees one leg of the work and scores it in isolation, which is how a
+correctly-configured evaluation ends up certifying a case nobody assessed as a whole.
+
+Map this onto the monitoring in `control-stack.md`: on-demand runs against the golden set on every
 prompt change; online evaluation as the continuous drift signal. Evaluation throughput is itself
 quota-bound (tokens per minute, spans per evaluation, evaluators per configuration), so a
 continuously-sampling online configuration over high alert volume needs a sampling rate chosen
-against those limits rather than set to "everything".
+against those limits rather than set to "everything". **Start at 5–10% of production traffic**: each
+evaluation is itself a model invocation, billed and quota-consuming like any other, so a configuration
+set to 100% roughly doubles your inference footprint in order to measure it. Raise the rate only if the
+signal is too noisy at that sample to act on.
 
 ---
 
@@ -560,13 +861,17 @@ already raised, or lowered, will change the answer.
 | Async job max duration | 8 hrs | The real ceiling for background work |
 | Streaming max duration | 60 min | Separate from both of the above |
 | Idle session timeout | 15 min default, adjustable (`idleRuntimeSessionTimeout`) | Return `HealthyBusy` from `/ping` during background work |
-| Max session lifetime | 8 hrs default, adjustable (`maxLifetime`) | Not for durable state — use Memory |
+| Max session lifetime | 8 hrs default, adjustable (`maxLifetime`) | In-memory state does not survive it — use Memory, or session storage if filesystem state must persist |
+| Session storage per session | 1 GB | Only if `filesystemConfigurations` is set; a PII surface once it is |
 | Max payload | 100 MB | Ample for case data; not for bulk exports |
 | Gateway invocation timeout | 15 min, adjustable | |
 | Targets per gateway / tools per target | 100 / 1,000, both adjustable | Plenty for one platform API |
 | Session creation rate | 25 TPS/account, adjustable | Shared across all endpoints — consider for batch fan-out (§6, §9) |
 | Data plane request rate | 1,000 TPS/account, adjustable | Shared across *all* data plane APIs, not per-API |
 | Memory resources per Region | 150, adjustable | Rules out naive per-tenant memory resources at scale |
+| Strategies per memory resource | 6, **not** adjustable (900 per account, adjustable) | Caps distinct extraction behaviours on one memory — design the layout around it |
+| Container image size | 2 GB, not adjustable | |
+| Direct code deploy package | 250 MB compressed / 750 MB uncompressed, not adjustable | A tree that fits a container may not fit here |
 | Session hardware | 2 vCPU / 8 GB, fixed | |
 
 **A `/ping` trap worth knowing.** The optional `time_of_last_update` field must be set only on an
@@ -577,8 +882,74 @@ hand-rolled `/ping`, check this. See the
 [HTTP protocol contract](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-http-protocol-contract.html)
 and [handling long-running agents](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-long-run.html).
 
-**Note the caller's timeout too.** API Gateway REST integrations cap at 29 seconds regardless of
-what AgentCore allows — see `production-rules.md` §11.
+**Note the caller's timeout too, and match the retry policy to the path.** API Gateway REST
+integrations cap at **29 seconds** regardless of what AgentCore allows (`production-rules.md` §11).
+That 29 seconds is API Gateway's *default* rather than an absolute ceiling: it can be raised through a
+Service Quotas increase, but only for **Regional and private REST APIs**, and only if you also raise
+the per-integration timeout and redeploy the stage. Three steps — skip either of the last two and the
+quota increase is granted while the old behaviour stays in place, which is a confusing afternoon.
+
+Retry configuration then follows from which path the call is on, because the two paths want opposite
+behaviour:
+
+| Path | Retry config | Why |
+|---|---|---|
+| Synchronous, behind a 29-second ceiling | `max_attempts=2, mode="standard"` | A retry that lands after the caller has already timed out is work you pay for and nobody reads. Fail fast and surface it. |
+| Async jobs and batch fan-outs (§6, §9) | `max_attempts=5, mode="adaptive"` | Nothing is waiting, so retries are cheap — and adaptive's **client-side rate limiting** is the part you actually want here, because it throttles the whole client when it sees rejection instead of letting a hundred workers race into the same quota. |
+
+Adaptive mode is the wrong default for interactive work for exactly the reason it is right for batch:
+it deliberately slows the client down.
+
+---
+
+## Prompt caching
+
+A compliance prompt is unusually well shaped for caching, and the reason is the governance discipline
+this skill already asks for. The system prompt, the bounded-assertion rules, the tool definitions, the
+few-shot examples and the pinned typology corpus are **identical across every alert in a batch**, and
+they change only when somebody deliberately versions them. That stability is precisely the
+precondition prompt caching needs, and most workloads do not have it — so this is a lever that pays off
+better here than the general advice suggests.
+
+Three effects, in order of how much they should change the design.
+
+**Cache reads do not count toward the Bedrock token quota at all.** For a batch fan-out (§6, §9) that
+is a *throughput increase*, not merely a discount — it is the one lever that raises effective tokens
+per minute without a quota request, which matters because the alternative is a Service Quotas case
+with a lead time attached. Treat it as relieving quota pressure rather than as a formula you can
+compute: AWS's own documentation is inconsistent about whether cache reads enter the initial
+reservation, so size the batch against observed throughput in your account instead of arithmetic from
+a doc page.
+
+**Cost moves sharply in both directions.** A cache write costs roughly **25% more** than standard
+input; a cache read costs roughly **90% less**. You therefore need **two requests inside the TTL to
+break even**, and caching a prefix that is used once an hour costs money instead of saving it. Match
+the TTL to the work: the **5-minute default** suits a batch sweep where hundreds of alerts share a
+prefix within minutes, while the **1-hour TTL** suits a system prompt and reference corpus that should
+outlive a single run.
+
+**It fails silently, and this skill's own habits are the likeliest cause.** Cache keys are exact,
+byte-for-byte prefix matches. A request ID, a retrieval timestamp, a corpus version string, or a tool
+schema re-serialised with a different key order — anything that varies per request and sits *before*
+the cache point — produces a fresh cache write on every single request, with no error, no warning, and
+a bill that looks exactly like caching was never switched on. The habits that cause it are ones this
+file recommends: stamping an audit identifier into the prompt, recording the retrieval time,
+version-pinning the corpus. All of that belongs **after** the cache point. Put the stable prefix first,
+mark it, and let every per-request value and every audit-record field follow it.
+
+Content below the model's minimum token threshold is ignored just as silently, and that threshold
+**differs by model and moves between generations of the same model** — so a model-ID change is a
+caching change, and the verification below has to be re-run after one.
+
+**Verify rather than assume.** The first request should report `cacheWriteInputTokens > 0` and the
+second `cacheReadInputTokens > 0` in the Converse `usage` object. Both zero means one of three things:
+the content is below the threshold, the model does not support caching, or your prefix is fragmented by
+a per-request value. Make that a standing post-deploy assertion alongside the others in this file,
+because it is the only way this particular failure ever becomes visible.
+
+Per-model thresholds, which models support the 1-hour TTL, and the `cachePoint` mechanics belong in the
+global `amazon-bedrock` skill (`amazon-bedrock/references/prompt-caching.md`) rather than pinned here — they change
+per model generation, and a stale number reproduces exactly the silent failure described above.
 
 ---
 
@@ -608,14 +979,32 @@ The most common way a compliance agent deployment is wrong is not that it failed
 resource reports healthy and the thing still does not work. Status is a statement about the control
 plane, not about behaviour.
 
-**Status is not evidence.** A runtime at `READY`, a policy engine at `ENFORCE`, a target at
-`ACTIVE` — each of these proves the resource was accepted and loaded. None of them proves it
-behaves correctly. A Cedar policy referencing an action name that does not exist enforces nothing;
-a Gateway target pointing at the wrong function ARN resolves and lists tools; an IAM policy missing
-the inference-profile ARN (`production-rules.md` §1) shows no sign of trouble until the first model
+**Status is not evidence.** `READY` on a runtime, `READY` on a Gateway target and `ENFORCE` on a policy
+engine all mean *loaded*. Each proves the resource was accepted. None of them proves it behaves
+correctly. A Cedar policy referencing an action name that does not exist enforces nothing; a Gateway
+target pointing at the wrong function ARN resolves and lists tools; an IAM policy missing the
+inference-profile ARN (`production-rules.md` §1) shows no sign of trouble until the first model
 call. Build post-deploy checks that **exercise the real path in both directions**: a call that
 should succeed and does, and a call that should be refused and is. The negative case is the one
 that carries the information, and it is the one people skip.
+
+**Read Gateway target status precisely, because the state names are not the ones people assume.**
+`GetGatewayTarget` reports `CREATING`, `UPDATING`, `UPDATE_UNSUCCESSFUL`, `DELETING`, `READY`,
+`FAILED`, `SYNCHRONIZING`, `SYNCHRONIZE_UNSUCCESSFUL`, `CREATE_PENDING_AUTH`, `UPDATE_PENDING_AUTH` or
+`SYNCHRONIZE_PENDING_AUTH`. There is **no `ACTIVE` state** — a wait loop or runbook written for one
+waits forever and then reports a timeout that has nothing to do with the target. Two of these read like
+failures and are not: `CREATE_PENDING_AUTH` and `UPDATE_PENDING_AUTH` mean the target is **waiting on a
+user to complete OAuth federation**, which is the expected resting state of a user-delegated target
+nobody has authorised yet — treat it as a prompt to the analyst, not an incident. The genuine error
+states are `FAILED`, `UPDATE_UNSUCCESSFUL` and `SYNCHRONIZE_UNSUCCESSFUL`, and the field that tells you
+*why* is **`statusReasons`**. Read it before theorising; it usually names the problem outright, and a
+wait loop that logs only the status throws that away. A target still in `CREATING` past about ten
+minutes is a support case rather than a configuration bug you can fix by editing the target.
+
+**Assert readiness on the endpoint, not only the runtime.** The runtime and its endpoint report status
+independently, and the runtime reaching `READY` first is the normal ordering — so a check that stops
+there declares success before the agent is invocable. Poll `get-agent-runtime-endpoint` as well and
+treat the pair as the readiness condition.
 
 **Absence of a CloudWatch log group is proof a Lambda was never invoked.** This is the fastest
 unambiguous check available for "is this target genuinely wired up" — not an empty log group, *no
@@ -644,6 +1033,7 @@ Analyst (authenticated, JWT)
       ▼
 Platform backend ─── derives session ID (tenant-namespaced, server-side)
       │              resolves tenant from resource record, never request body
+      │              constructs the InvokeHarness request; strips every override field
       ▼
 AgentCore Gateway ── Cedar Policy (ENFORCE) evaluates every tool call
       │              REQUEST interceptor: RFC 8693 token exchange → analyst's own identity
@@ -658,9 +1048,11 @@ Structured proposal ──► deterministic validation ──► human decision 
 ```
 
 The properties that matter: the agent never touches the database, never holds a credential, cannot
-write, cannot choose its own session, and cannot dispose of anything. Every one of those is
-enforced by infrastructure rather than by prompt.
+write, cannot choose its own session, cannot choose its own tools, model, prompt or actor, and
+cannot dispose of anything. Every one of those is enforced by infrastructure or by the calling
+backend rather than by prompt.
 
 And every one of them should be *demonstrated* before the deployment is called done — a denied
 write attempt, a cross-tenant tool call that fails, a session ID from a request body that does not
-route. A control you have only configured is a control you are hoping for.
+route, an `InvokeHarness` request carrying a `skills` override that the backend drops on the floor.
+A control you have only configured is a control you are hoping for.

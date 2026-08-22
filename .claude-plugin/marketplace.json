@@ -8,6 +8,7 @@
   "plugins": [
     {
       "name": "agentcore-compliance-ops",
+      "version": "1.0.0",
       "description": "Design, build, review and debug AgentCore agents for regulated financial-crime compliance work. Ships one skill, three specialist subagents, and a session hook that checks for an authoritative AWS documentation source.",
       "source": "./",
       "category": "development"

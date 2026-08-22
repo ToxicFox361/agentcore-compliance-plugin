@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
-# SessionStart hook — verify the AWS documentation MCP is available.
+# SessionStart hook — verify an authoritative AgentCore documentation source is available.
 #
 # The agentcore-compliance-ops skill instructs the agent to verify AgentCore API
-# surface against live documentation rather than recalled detail. AgentCore
+# surface against an authoritative source rather than recalled detail. AgentCore
 # changes quickly: model IDs, quota codes, API shapes and enforcement dates all
-# move. Without the aws-agents plugin the agent has no authoritative source and
-# will answer from memory, which is exactly the failure the skill warns about.
+# move. With no authoritative source the agent answers from memory, which is
+# exactly the failure the skill warns about.
 #
-# Silent when everything is present. Only speaks when something is missing.
+# There are two acceptable sources, in order of preference:
+#   1. The first-party global `amazon-bedrock` skill (~/.claude/skills/amazon-bedrock/).
+#      AWS's own guidance; covers Runtime, Gateway, Harness, Memory, model
+#      selection, quota mechanics and Guardrails, and loads by description.
+#      Its presence is sufficient — this hook goes silent.
+#   2. An AWS documentation MCP (aws-agents@claude-plugins-official), which is
+#      supplementary: it can reach the pages `amazon-bedrock` does not carry
+#      (Policy/Cedar detail, current AgentCore quotas, MMDSv2).
+#
+# Silent when a source is present. Only speaks when both are missing.
 # Always exits 0 — a broken doc-check must never block a session.
 
 set -uo pipefail
@@ -16,11 +25,26 @@ PLUGIN="aws-agents"
 MARKETPLACE="claude-plugins-official"
 PLUGIN_ID="${PLUGIN}@${MARKETPLACE}"
 CACHE_DIR="${HOME}/.claude/plugins/cache/${MARKETPLACE}/${PLUGIN}"
+BEDROCK_SKILL="${HOME}/.claude/skills/amazon-bedrock/SKILL.md"
 
-# Resolve the project root from the hook payload when available, else cwd.
-PAYLOAD="$(cat 2>/dev/null || true)"
-PROJECT_DIR="$(printf '%s' "$PAYLOAD" | jq -r '.cwd // empty' 2>/dev/null || true)"
-[ -z "$PROJECT_DIR" ] && PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+# Preferred source present — the session has AWS's own guidance. Say nothing.
+# Checked before anything else so users with the better source are never nagged.
+[ -f "$BEDROCK_SKILL" ] && exit 0
+
+# This check is best-effort. Without jq the settings inspection below cannot run,
+# and a silent false "not enabled" would be worse than saying nothing at all.
+command -v jq >/dev/null 2>&1 || exit 0
+
+# Resolve the project root. The hook payload also carries .cwd, but reading stdin
+# blocks to the hook timeout if stdin is ever a terminal, so rely on the
+# environment instead — Claude Code sets CLAUDE_PROJECT_DIR for hooks.
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+
+SETTINGS_FILES=(
+  "${PROJECT_DIR}/.claude/settings.json"
+  "${PROJECT_DIR}/.claude/settings.local.json"
+  "${HOME}/.claude/settings.json"
+)
 
 enabled_in() {
   # Enabled if the key is literally true, or an array (version-constraint form).
@@ -32,12 +56,24 @@ enabled_in() {
   ' "$f" >/dev/null 2>&1
 }
 
+disabled_in() {
+  # Explicitly set to false — a deliberate opt-out, not an oversight.
+  local f="$1"
+  [ -f "$f" ] || return 1
+  jq -e --arg id "$PLUGIN_ID" '.enabledPlugins[$id] == false' "$f" >/dev/null 2>&1
+}
+
 is_enabled=1
-for f in "${PROJECT_DIR}/.claude/settings.json" \
-         "${PROJECT_DIR}/.claude/settings.local.json" \
-         "${HOME}/.claude/settings.json"; do
+for f in "${SETTINGS_FILES[@]}"; do
   if enabled_in "$f"; then is_enabled=0; break; fi
 done
+
+# Not enabled anywhere, but explicitly disabled somewhere — honour the opt-out.
+if [ "$is_enabled" -ne 0 ]; then
+  for f in "${SETTINGS_FILES[@]}"; do
+    if disabled_in "$f"; then exit 0; fi
+  done
+fi
 
 is_installed=1
 [ -d "$CACHE_DIR" ] && [ -n "$(ls -A "$CACHE_DIR" 2>/dev/null)" ] && is_installed=0
@@ -53,14 +89,23 @@ else
   reason="enabled in settings but not present in the plugin cache"
 fi
 
-CONTEXT="The AWS documentation MCP (${PLUGIN_ID}) is ${reason}.
+CONTEXT="No authoritative AgentCore documentation source was found. The
+first-party amazon-bedrock skill is not installed at
+~/.claude/skills/amazon-bedrock/, and the AWS documentation MCP (${PLUGIN_ID})
+is ${reason}.
 
-This project's agentcore-compliance-ops skill requires an authoritative
-documentation source. Amazon Bedrock AgentCore changes frequently — model IDs,
-service quotas, API shapes, IAM resource formats and enforcement dates all move.
-Answering from recalled detail produces confidently wrong infrastructure code.
+This project's agentcore-compliance-ops skill needs one of them. Amazon Bedrock
+AgentCore changes frequently — model IDs, service quotas, API shapes, IAM
+resource formats and enforcement dates all move. Answering from recalled detail
+produces confidently wrong infrastructure code.
 
-Before generating or reviewing any AgentCore code this session, install it:
+Preferred: the first-party amazon-bedrock skill. It is AWS's own guidance and the
+authority for the Bedrock and AgentCore API surface — Runtime, Gateway, Harness,
+Memory, model selection, prompt caching, quota mechanics and Guardrails.
+
+Supplementary: the AWS documentation MCP, which reaches the pages that skill does
+not carry — Policy/Cedar detail, current AgentCore quotas and limits, and MMDSv2.
+Install it with:
 
   claude plugin install ${PLUGIN_ID} --scope project
 
@@ -68,12 +113,19 @@ Then run /reload-plugins. The MCP tools appear as
 mcp__plugin_aws-agents_awsknowledge__aws___search_documentation and
 ...___read_documentation — load them with ToolSearch before use.
 
-If the user declines, say so plainly and flag that AgentCore specifics in your
-output are unverified against current documentation."
+Note the split of authority in both directions. On platform detail the AWS
+sources win over anything recalled. But this plugin stays authoritative on two
+points where amazon-bedrock is behind: its Runtime deployment workflow omits the
+MMDSv2 update step entirely, so following it yields a runtime that cannot be
+invoked, and it defers Policy/Cedar to live docs where this plugin's
+examples/cedar_policies.md is substantially more detailed.
+
+With neither source available, say so plainly and flag that AgentCore specifics
+in your output are unverified against current documentation."
 
 jq -nc \
   --arg ctx "$CONTEXT" \
-  --arg msg "AWS docs MCP (${PLUGIN_ID}) ${reason} — AgentCore guidance this session will be unverified." \
+  --arg msg "No AgentCore doc source found (amazon-bedrock skill absent; ${PLUGIN_ID} ${reason}) — AgentCore guidance this session will be unverified." \
   '{
      systemMessage: $msg,
      hookSpecificOutput: {

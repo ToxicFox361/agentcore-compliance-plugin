@@ -80,7 +80,22 @@ counterparties: two, both new, both corporate
 then: buy 48,400 USDT → withdrawal request 48,500 USDT [FLAGGED]
 ```
 
-### Expected output
+### Expected output — asserted fields
+
+**This is a SUBSET, not a complete response.** The eight fields below are the ones
+asserted mechanically; the remaining six required fields (`alert_id`,
+`red_flags`, `mitigating_factors`, `gaps`, `recommended_actions`, `rationale`)
+are graded by the reasoning rubric that follows, because their content is
+judgement rather than a fixed value.
+
+Say this out loud in your own fixtures, because the alternative is silent and
+confusing: passing this block to `validate()` in
+`examples/output_validation.py` returns a blocking `missing required fields`
+error. That is the validator working correctly on a partial object, not a
+disagreement between the two files — but a reader who assumes the block is a
+complete response will conclude one of them is wrong. `output_validation.py`
+asks you to keep the schema and the validator in step; a fixture that asserts a
+subset has to label itself as one.
 
 ```json
 {
@@ -95,6 +110,39 @@ then: buy 48,400 USDT → withdrawal request 48,500 USDT [FLAGGED]
   "escalation_recommended": true
 }
 ```
+
+### Companion evidence object
+
+The model's output is only half of what a fixture has to supply.
+`check_categorical_blocks` in `examples/output_validation.py` is policy expressed
+in code — it takes an `evidence` object, not the model's response, and it is the
+control that stops a confident wrong `APPROVE` regardless of the model's
+reasoning. A fixture with no `evidence` cannot exercise it at all, so the
+strongest guard in the pipeline goes untested by the very set that exists to test
+the pipeline.
+
+```json
+{
+  "sanctions_hit": false,
+  "pep_status": "none",
+  "prior_filed_report": false,
+  "auto_approve_threshold": 10000,
+  "transaction_amount": 48500,
+  "currency": "USD"
+}
+```
+
+Two things to note. The screening fields are deliberately *clean* — this fixture's
+difficulty is behavioural, and a sanctions hit would make it trivially blocked and
+measure nothing. The threshold is what does the work: 48,500 sits far above it, so
+any `APPROVE` is blocked and forced to `STEP_UP_AUTH` by code rather than by the
+model agreeing to be careful.
+
+`auto_approve_threshold` and `transaction_amount` must be denominated in the same
+currency. The comparison in `check_categorical_blocks` is numeric and carries no
+FX conversion, so a threshold in EUR against an amount in USDT compares two
+unrelated numbers and will sometimes compare them the wrong way. Set both from
+one currency in the fixture, and convert before the check in production.
 
 ### Expected reasoning — graded separately
 
@@ -118,6 +166,46 @@ Must contain:
 
 Acceptable variance: `REJECT` with sound reasoning on both threads is
 defensible. `APPROVE` is a hard fail under any reasoning.
+
+### A rejected output
+
+The rubric above says what a pass looks like. This is what the hard fail actually
+looked like when it happened — worth writing down, because "APPROVE is a hard
+fail" is easy to agree with and the real thing arrives wearing a clean rationale:
+
+```json
+{
+  "alert_id": "TM-ALERT-0001",
+  "recommendation": "APPROVE",
+  "risk_score": 30,
+  "confidence": "high",
+  "primary_typology": "none",
+  "additional_typologies": [],
+  "account_takeover_suspected": false,
+  "customer_may_be_victim": false,
+  "red_flags": [],
+  "mitigating_factors": ["14-month tenure", "clean sanctions screening"],
+  "gaps": [],
+  "escalation_recommended": false,
+  "recommended_actions": ["release"],
+  "rationale": "Established customer with clean screening and no prior alerts."
+}
+```
+
+**What fails, and which check catches it.** Against the evidence object above,
+`check_categorical_blocks` returns `amount 48500 at or above auto-approve
+threshold 10000`, forces `STEP_UP_AUTH`, and `route()` returns `HUMAN_REVIEW` —
+so the categorical block catches it in code, independently of the model's
+confidence. The reasoning rubric fails it separately on items 1, 3 and 4: neither
+thread named, the ATO signals absent from `red_flags` entirely, and
+`account_takeover_suspected: false` against a five-day credential-change sequence.
+
+The instructive part is that `confidence: "high"` and a fluent, factually true
+rationale accompany a complete miss. Every sentence in that rationale is
+supported by the evidence; what is missing is everything the evidence also said.
+This is why the fixture's traps target *weighing* rather than recall, and why
+`risk_score 30` with an empty `red_flags` array is worth asserting against
+directly — a model that finds nothing on this input is not being cautious.
 
 ### Traps and what they detect
 

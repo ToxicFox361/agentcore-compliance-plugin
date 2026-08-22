@@ -33,6 +33,52 @@ QUEUE_URL = os.environ["USAGE_QUEUE_URL"]
 SYSTEM_PROMPT = os.environ["SYSTEM_PROMPT"]
 GATEWAY_URL = os.environ["GATEWAY_URL"]        # AgentCore Gateway MCP endpoint
 
+# ── On the model ID above ────────────────────────────────────────────────────
+#
+# `nova-2-lite` is a cheap placeholder for an example, NOT a recommendation for
+# supervised triage. Every model ID in these examples is Nova or Mistral because
+# they are inexpensive to demonstrate against, and that is the only reason.
+#
+# Make the actual selection against the global first-party `amazon-bedrock`
+# skill's model-selection guide (installed at ~/.claude/skills/amazon-bedrock/),
+# which is maintained and which this file is not a substitute for.
+#
+# One field observation, offered as a reason to measure rather than as guidance:
+# on an AML alert-triage golden set, a mid-tier general model (nova-pro)
+# outscored every Claude configuration tested on the bounded classification task
+# while running 5-15x faster — and asking that same mid-tier model to reason
+# before emitting JSON collapsed schema compliance to under a third. Neither
+# result is AWS guidance and neither should be assumed to transfer to your
+# fixtures. What they support is the standing rule: test, do not assume that
+# capability tiers transfer across vendors or that a stronger model is stronger
+# at YOUR task (§16, §17). A bounded-classification-with-strict-schema workload
+# is a narrow ask, and narrow asks rank models differently from open generation.
+#
+# Whatever you pick, pin it on the record below — a decision made under one model
+# is not evidence about another.
+
+# ── Versions travel on the record ────────────────────────────────────────────
+#
+# control-stack.md layer 3 requires schemas to be versioned alongside prompts, and
+# every audit record to carry the prompt/template version. A stored assessment is
+# only interpretable against the prompt and schema in force when it was produced:
+# without these, a QA reviewer re-reading a six-month-old output cannot tell
+# whether a field meant then what it means now, and "the prompt was changed in
+# March" becomes unanswerable for any individual record.
+#
+# Required from the environment rather than defaulted. A default like "unknown"
+# or "v1" is the placeholder-that-reads-like-data defect from
+# examples/output_validation.py applied to provenance: it produces records that
+# assert a version they were never built against, and unlike a missing field it
+# will be believed. Failing at import is the cheap outcome.
+#
+# Both must be asserted by the deploy pipeline against their sources — the
+# `prompt-version` marker at the top of examples/alert_triage_prompt.md and
+# SCHEMA_VERSION in examples/output_validation.py. Nothing at runtime can detect
+# a mismatch; the container has a string, not the schema.
+PROMPT_VERSION = os.environ["PROMPT_VERSION"]   # e.g. alert-triage-v1
+SCHEMA_VERSION = os.environ["SCHEMA_VERSION"]   # e.g. alert-triage-v1
+
 # ── Inference parameters: state them, never inherit them ─────────────────────
 #
 # Bedrock's InferenceConfiguration has exactly four members — maxTokens,
@@ -137,7 +183,7 @@ def _workload_token() -> str:
 # So: this agent reads. Anything that writes — closing an alert, filing a
 # report, changing a rating — is not in the list, and the deterministic write
 # paths live in code that runs after a human decides (see
-# references/guardrails.md). Cedar policy at the Gateway is the second layer
+# references/control-stack.md). Cedar policy at the Gateway is the second layer
 # that catches a mistake here; IAM is the third. The prompt is not a layer.
 #
 # Names are as the AgentCore Gateway presents them — `<targetName>___<toolName>`
@@ -252,8 +298,20 @@ def gateway_client(access_token: str) -> MCPClient:
         # window in which an unfiltered catalogue exists to be passed to an
         # Agent by mistake. Matchers may also be regexes or callables.
         #
-        # This also strips the `x_amz_bedrock_agentcore_search` tool the Gateway
-        # injects — deliberate here, since the point is a closed list.
+        # The allow-list also excludes `x_amz_bedrock_agentcore_search`, which is
+        # worth knowing about precisely because it does not behave like the other
+        # tools. It is OPT-IN, not injected: the Gateway provisions it only when
+        # semantic search is enabled at CreateGateway, so on a Gateway without
+        # that setting it is simply absent and there is nothing to strip. And it
+        # is NOT target-prefixed — it does not follow the
+        # `<targetName>___<toolName>` convention every entry in
+        # ALLOWED_TOOL_NAMES uses, so a prefix-shaped allow-list excludes it as a
+        # side effect rather than by decision.
+        #
+        # Relying on that side effect is the mistake. If you enable semantic
+        # search later and widen this filter to a pattern, the search tool can
+        # arrive without anyone choosing it — and a tool that discovers other
+        # tools is exactly the one a closed list exists to keep out.
         tool_filters={"allowed": sorted(ALLOWED_TOOL_NAMES)},
     )
 
@@ -316,12 +374,19 @@ def build_agent(tools: list | None = None) -> Agent:
 
 
 def emit_usage(input_tokens: int, output_tokens: int, total_tokens: int,
+               cache_read_tokens: int, cache_write_tokens: int,
                tenant_id: str, request_id: str) -> None:
     """Emit a usage event for cost attribution.
 
     model_id is mandatory. Without it the aggregation layer cannot apply
     per-model rates and a tenant running several models is billed at whichever
     single rate happened to be hardcoded (§9).
+
+    The cache token counts are mandatory for the same reason. A cached request
+    bills on four axes, and an emitter that sends only two makes the aggregation
+    layer's zero indistinguishable from a genuine zero — so the discount never
+    reaches the tenant and nothing in the pipeline can tell. See
+    examples/cost_tracking.py, which prices all four.
 
     Deliberately does NOT carry prompt or response text — usage events are
     retained for billing, and customer PII should not ride along.
@@ -337,6 +402,8 @@ def emit_usage(input_tokens: int, output_tokens: int, total_tokens: int,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": total_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens,
                 "request_id": request_id,
             }),
         )
@@ -351,7 +418,7 @@ def invoke(payload, context):
 
     Returns a *proposal*, never a decision. Nothing downstream may convert this
     into a disposition without a human acting under their own identity — see
-    references/guardrails.md.
+    references/control-stack.md.
     """
     # context.session_id is set by AgentCore from the runtimeSessionId the
     # caller supplied. The caller must derive that server-side, namespaced by
@@ -405,10 +472,19 @@ def invoke(payload, context):
             usage.get("inputTokens", 0),
             usage.get("outputTokens", 0),
             usage.get("totalTokens", 0),
+            # Bedrock's own field names on the usage object. Absent on models
+            # that do not support prompt caching and on requests that did not use
+            # it, which is why 0 is the right default HERE and the wrong default
+            # in the aggregation layer — this is the only place that can tell the
+            # difference between "the model reported nothing" and "nobody asked".
+            usage.get("cacheReadInputTokens", 0),
+            usage.get("cacheWriteInputTokens", 0),
             TENANT_ID,
             request_id,
         )
 
+    # The audit record. Everything needed to say what produced this proposal,
+    # because the record IS the reconstruction — there is no seed and no replay.
     return {
         "proposal": result.message,
         "request_id": request_id,
@@ -418,6 +494,13 @@ def invoke(payload, context):
         # on: the reconstruction of this decision is the record — inputs, model
         # and settings — not the hope that a re-run reproduces it (§24).
         "inference_parameters": INFERENCE_PARAMETERS,
+        # The other two axes the output depends on. Model ID and sampling
+        # settings without these are half a provenance record: the same model at
+        # the same temperature against a revised prompt is a different system,
+        # and a stored output is only interpretable against the schema in force
+        # when it was produced.
+        "prompt_version": PROMPT_VERSION,
+        "schema_version": SCHEMA_VERSION,
     }
 
 

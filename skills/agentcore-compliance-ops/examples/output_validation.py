@@ -4,7 +4,7 @@ Runs AFTER the model responds and BEFORE a human sees the result. These are the
 rules the model cannot override — the difference between a proposal a reviewer
 can trust and one they must independently re-derive.
 
-See references/guardrails.md for the full control stack. This file implements
+See references/control-stack.md for the full control stack. This file implements
 layers 3 (typed output, no silent repair) and 5 (deterministic post-generation
 validation).
 
@@ -18,6 +18,16 @@ from decimal import Decimal
 from typing import Any, Literal
 
 Recommendation = Literal["APPROVE", "STEP_UP_AUTH", "REJECT"]
+
+# Schemas are versioned alongside prompts (control-stack.md, layer 3): a stored
+# output is only interpretable against the schema in force when it was produced.
+# Bump this whenever a field is added, removed, or changes meaning, and carry it
+# on the audit record next to the prompt version, model ID and inference
+# parameters — see examples/agent_template.py. Without it, a re-read of a
+# six-month-old assessment silently applies today's field semantics to
+# yesterday's output, and a QA sample or an examiner cannot tell that the
+# schema moved underneath the record.
+SCHEMA_VERSION = "alert-triage-v1"
 
 # Mirrors the output schema in examples/alert_triage_prompt.md, field for
 # field. Keep the two in step. A field the prompt asks for but the validator
@@ -49,6 +59,21 @@ BOOLEAN_FIELDS = ("account_takeover_suspected", "customer_may_be_victim",
 VALID_RECOMMENDATIONS = {"APPROVE", "STEP_UP_AUTH", "REJECT"}
 VALID_CONFIDENCE = {"low", "medium", "high"}
 
+# The bounded-assertion model from references/control-stack.md layer 2, expressed
+# as an enum the validator can actually enforce. GAP is deliberately absent:
+# gaps have their own field, so a "gap" arriving as a red flag is a
+# mis-classification worth blocking rather than accepting.
+#
+# The failure mode this closes: a free-text red flag is how a legal conclusion
+# re-enters an output whose schema was supposed to make that impossible.
+# `red_flags: ["the customer is laundering money"]` — the exact sentence
+# control-stack.md names as the excluded case — used to pass every check and route
+# clean, because `isinstance(list)` was the only assertion made about the field.
+# control-stack.md requires violations to be *detectable*, not merely discouraged,
+# and a prompt instruction ("you may NOT reach legal conclusions") is a request.
+# This is the part that is a control.
+VALID_RED_FLAG_KINDS = {"OBSERVATION", "CONSISTENCY_NOTE"}
+
 MAX_RATIONALE_WORDS = 120
 
 
@@ -61,12 +86,74 @@ class ValidationResult:
     forced_recommendation: Recommendation | None = None
 
     def to_audit_record(self) -> dict[str, Any]:
+        # The schema version travels with the verdict, not just with the output.
+        # A stored "passed: true" is a claim about which rules ran, and those
+        # rules change — an assertion that validation passed is uninterpretable
+        # without knowing which schema it passed against.
         return {
+            "schema_version": SCHEMA_VERSION,
             "passed": self.passed,
             "blocking_errors": self.blocking_errors,
             "warnings": self.warnings,
             "forced_recommendation": self.forced_recommendation,
         }
+
+
+def validate_red_flags(red_flags: Any) -> list[str]:
+    """Structural validation of the red_flags entries themselves. Blocking.
+
+    Blocking rather than a warning, because a red flag is the field that carries
+    the model's assertions about the subject. A warning would let the assertion
+    reach the reviewer with a note attached, and notes are read as commentary
+    while the sentence is read as a finding.
+
+    Three properties, each closing a distinct route back to free text:
+
+      * dict, not str — a bare string has no `kind` slot at all, so there is
+        nowhere for the bounded-assertion model to be checked. This is the
+        canonical violation and the reason this function exists.
+      * `kind` in VALID_RED_FLAG_KINDS — blocks a well-formed object that simply
+        declares its own category, e.g. `kind: "LEGAL_CONCLUSION"`. A model
+        inventing a category is not an error the schema can absorb.
+      * `evidence_id` a string — makes citation grounding checkable at all.
+        check_citation_grounding below can only compare what exists.
+    """
+    errors: list[str] = []
+
+    # A non-list red_flags is already reported by the LIST_FIELDS check in
+    # validate_schema; do not report it twice.
+    if not isinstance(red_flags, list):
+        return errors
+
+    for i, flag in enumerate(red_flags):
+        if not isinstance(flag, dict):
+            errors.append(
+                f"red_flags[{i}] must be an object with statement/kind/"
+                f"evidence_id, got {type(flag).__name__}: {flag!r}"
+            )
+            continue
+
+        statement = flag.get("statement")
+        if not isinstance(statement, str) or not statement.strip():
+            errors.append(
+                f"red_flags[{i}].statement {statement!r} must be a non-empty string"
+            )
+
+        kind = flag.get("kind")
+        if kind not in VALID_RED_FLAG_KINDS:
+            errors.append(
+                f"red_flags[{i}].kind {kind!r} not in "
+                f"{sorted(VALID_RED_FLAG_KINDS)}"
+            )
+
+        cite = flag.get("evidence_id")
+        if not isinstance(cite, str):
+            errors.append(
+                f"red_flags[{i}].evidence_id must be a string, got "
+                f"{type(cite).__name__}"
+            )
+
+    return errors
 
 
 def validate_schema(output: dict[str, Any]) -> list[str]:
@@ -107,8 +194,20 @@ def validate_schema(output: dict[str, Any]) -> list[str]:
                 f"{bool_field} {output.get(bool_field)!r} must be a boolean"
             )
 
-    rationale = output.get("rationale", "")
-    if len(rationale.split()) > MAX_RATIONALE_WORDS:
+    errors += validate_red_flags(output.get("red_flags"))
+
+    # Type before length. `output.get("rationale", "")` looks safe and is not:
+    # the default only applies when the key is ABSENT, so a model emitting
+    # `"rationale": null` supplies the key, gets None back, and `.split()`
+    # raises AttributeError straight out of validate_schema and validate() —
+    # crashing the pipeline on exactly the malformed response this file exists
+    # to convert into a blocking error routed to human review. An unhandled
+    # exception is not a fail-safe: the caller sees a 500, not a case needing a
+    # reviewer.
+    rationale = output.get("rationale")
+    if not isinstance(rationale, str):
+        errors.append(f"rationale {rationale!r} must be a string")
+    elif len(rationale.split()) > MAX_RATIONALE_WORDS:
         errors.append(f"rationale exceeds {MAX_RATIONALE_WORDS} words")
 
     return errors
@@ -137,13 +236,88 @@ def check_categorical_blocks(output: dict[str, Any],
     if evidence.get("pep_status") in {"domestic", "foreign", "international"}:
         blocks.append("PEP status present — APPROVE blocked")
 
-    threshold = evidence.get("auto_approve_threshold")
-    amount = evidence.get("transaction_amount")
-    if threshold is not None and amount is not None and Decimal(str(amount)) >= Decimal(str(threshold)):
-        blocks.append(f"amount {amount} at or above auto-approve threshold {threshold}")
+    blocks.extend(_threshold_block(evidence))
 
     # Escalate rather than reject: the correct disposition is a human's to make.
     return blocks, ("STEP_UP_AUTH" if blocks else None)
+
+
+def _threshold_block(evidence: dict[str, Any]) -> list[str]:
+    """The amount-versus-threshold comparison, with currency treated as required.
+
+    This check used to compare two bare numbers:
+
+        if Decimal(str(amount)) >= Decimal(str(threshold)): ...
+
+    On a single-currency book that is correct. On a multi-currency one it is a
+    categorical control that silently does not apply: 8,000 USD against a 10,000
+    EUR threshold reads as under-threshold, the block never fires, and the case
+    auto-approves on a comparison that meant nothing. Nothing in the output looks
+    wrong, which is why it survives review.
+
+    Three rules, and the last one is the point:
+
+      1. Same currency — compare, as before.
+      2. Different currencies — use a conversion the CALLER supplied, together
+         with the rate and its as-of timestamp.
+      3. Different currencies and no conversion supplied, or a currency missing
+         altogether — **block**, and record it as a blocking error.
+
+    Rule 3 is the change. Skipping the comparison is the old behaviour and it
+    fails open on exactly the case the control exists for.
+
+    Conversion deliberately does not happen here. An FX rate is a data
+    dependency and an audit input: the rate used and its as-of date belong on the
+    decision record, because a threshold decision is only reconstructable if you
+    know what rate produced it. A validator that quietly fetches a rate makes its
+    own input invisible, and makes the same case decide differently on Tuesday
+    than on Monday with no record of why. A bare number is not an amount.
+    """
+    blocks: list[str] = []
+
+    threshold = evidence.get("auto_approve_threshold")
+    amount = evidence.get("transaction_amount")
+    if threshold is None or amount is None:
+        return blocks  # nothing asserted about amount; not this check's business
+
+    t_ccy = evidence.get("auto_approve_threshold_currency")
+    a_ccy = evidence.get("transaction_currency")
+
+    if not t_ccy or not a_ccy:
+        blocks.append(
+            "amount or threshold supplied without a currency — comparison "
+            "refused, APPROVE blocked"
+        )
+        return blocks
+
+    if t_ccy == a_ccy:
+        if Decimal(str(amount)) >= Decimal(str(threshold)):
+            blocks.append(
+                f"amount {amount} {a_ccy} at or above auto-approve threshold "
+                f"{threshold} {t_ccy}"
+            )
+        return blocks
+
+    # Currencies differ. Require a pre-converted amount plus its provenance.
+    converted = evidence.get("transaction_amount_in_threshold_currency")
+    rate = evidence.get("fx_rate")
+    rate_as_of = evidence.get("fx_rate_as_of")
+
+    if converted is None or rate is None or not rate_as_of:
+        blocks.append(
+            f"amount is {a_ccy} and threshold is {t_ccy} with no supplied "
+            f"conversion (need transaction_amount_in_threshold_currency, "
+            f"fx_rate and fx_rate_as_of) — comparison refused, APPROVE blocked"
+        )
+        return blocks
+
+    if Decimal(str(converted)) >= Decimal(str(threshold)):
+        blocks.append(
+            f"amount {amount} {a_ccy} = {converted} {t_ccy} at rate {rate} "
+            f"as of {rate_as_of}, at or above auto-approve threshold "
+            f"{threshold} {t_ccy}"
+        )
+    return blocks
 
 
 def check_internal_consistency(output: dict[str, Any]) -> list[str]:
@@ -195,6 +369,18 @@ def check_citation_grounding(output: dict[str, Any],
                 warnings.append(f"red_flags[{i}] cites unknown evidence {cite!r}")
             elif not cite:
                 warnings.append(f"red_flags[{i}] has no evidence citation")
+        else:
+            # An `if isinstance(...)` with no `else` is a grounding check that
+            # skips precisely the entries it should reject: a bare string has no
+            # evidence_id to look up, so the loop body was unreachable and the
+            # unciteable claim passed through unremarked. validate_red_flags
+            # blocks this shape earlier, but this function is also callable on
+            # its own — a check that only holds because something upstream held
+            # is not a check.
+            warnings.append(
+                f"red_flags[{i}] is not an object and carries no citation: "
+                f"{flag!r}"
+            )
     return warnings
 
 
@@ -242,7 +428,7 @@ def route(output: dict[str, Any], validation: ValidationResult) -> str:
 
     # Even a clean APPROVE goes to a human in a supervised deployment.
     # Only open an unattended path after measured reliability evidence and with
-    # standing quality sampling — see guardrails.md, "The graduation question".
+    # standing quality sampling — see control-stack.md, "The graduation question".
     return "HUMAN_REVIEW"
 
 
