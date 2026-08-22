@@ -18,6 +18,23 @@ agentcore_runtime = boto3.client("bedrock-agentcore", region_name=REGION)
 READY_POLL_SECONDS = 5
 READY_MAX_ATTEMPTS = 60
 
+# The ONLY states from which READY is still reachable. Everything else is
+# terminal for the purposes of waiting — see wait_until_ready.
+#
+# Deliberately an allow-list of in-progress states rather than a deny-list of
+# failure states. A deny-list has to be complete to work, and it never is: the
+# documented set for the runtime is
+# CREATING | CREATE_FAILED | UPDATING | UPDATE_FAILED | READY | DELETING, but
+# AWS also documents DELETE_FAILED as terminal for the sibling harness resource,
+# and the service adds states faster than example code is revised. With a
+# deny-list, every state AWS adds is one the poller silently treats as "keep
+# waiting" and burns the full timeout on.
+#
+# DELETING is transitional in the API's lifecycle but terminal here: a runtime
+# being torn down will never reach READY, so polling it to the timeout only
+# delays the report of something already decided.
+PENDING_READY_STATES = frozenset({"CREATING", "UPDATING"})
+
 
 class PlaceholderError(RuntimeError):
     """Generated code still contains an unsubstituted placeholder."""
@@ -54,10 +71,14 @@ def wait_until_ready(agent_runtime_id: str) -> str:
         print(f"attempt {attempt}/{READY_MAX_ATTEMPTS}: status={status}")
         if status == "READY":
             return status
-        # Documented terminal failure states. The full set is
-        # CREATING | CREATE_FAILED | UPDATING | UPDATE_FAILED | READY | DELETING;
-        # treat anything unexpected as a reason to stop polling, not to loop.
-        if status in {"CREATE_FAILED", "UPDATE_FAILED", "DELETING"}:
+        # Anything not known to be heading for READY is terminal. The previous
+        # form enumerated CREATE_FAILED / UPDATE_FAILED / DELETING and slept on
+        # everything else, so an unlisted terminal state — DELETE_FAILED, or
+        # whatever the service adds next — polled for the full five minutes and
+        # then reported a TimeoutError, which reads like a slow deploy rather
+        # than a failed one. Inverting the test makes an unknown state fail fast
+        # and name itself.
+        if status not in PENDING_READY_STATES:
             raise RuntimeError(f"runtime {agent_runtime_id} entered {status}")
         time.sleep(READY_POLL_SECONDS)
     raise TimeoutError(f"runtime {agent_runtime_id} not READY after "
@@ -126,12 +147,49 @@ def deploy_agent(tenant_id: str, config: dict, source: str,
         "status": "READY",
         "modelId": config["modelId"],
         "deployedAt": _now_iso(),
+        # Starts pessimistic and is corrected below once observed. False here is
+        # not a guess — it is the only state we can honestly assert before step
+        # 4 runs, and it is the fail-safe direction: a crash between this write
+        # and that one leaves a row saying "do not route traffic here", which is
+        # recoverable. The inverse leaves a row promising an invocable runtime.
+        "mmdsV2Enabled": False,
     })
 
     # 4 ── assert MMDSv2, remediating if needed. After the persist for the same
     #      reason as everything else here: the runtime already exists and must
     #      be tracked whether or not this call succeeds.
-    mmdsv2 = ensure_mmdsv2(runtime_id)
+    #
+    #      Wrapped exactly as step 5 is, and for the same reason. Unwrapped, a
+    #      raise here made deploy_agent fail AFTER the row above had durably
+    #      recorded "status": "READY" — a record asserting a healthy runtime for
+    #      one that cannot be invoked at all. That is the orphaned-resource class
+    #      this whole ordering exists to prevent, reintroduced through the one
+    #      step left outside the guard.
+    #
+    #      Unlike the smoke test, this is NOT diagnostic. CreateAgentRuntime
+    #      cannot accept metadataConfiguration and AgentCore rejects invocation
+    #      without requireMMDSV2, so the runtime is uninvocable until this
+    #      succeeds — which is why the observed value is written onto the
+    #      persisted row and not only returned to a caller that may not survive.
+    #      A platform that cannot distinguish invocable from uninvocable rows
+    #      will route a tenant's traffic at one it cannot use.
+    try:
+        mmdsv2 = ensure_mmdsv2(runtime_id)
+        # Key must match your table's actual schema; put_item above writes
+        # tenantId + agentRuntimeId, so that is the composite key assumed here.
+        agent_table.update_item(
+            Key={"tenantId": tenant_id, "agentRuntimeId": runtime_id},
+            UpdateExpression="SET mmdsV2Enabled = :m",
+            ExpressionAttributeValues={":m": mmdsv2},
+        )
+    except Exception as e:
+        # Both the enablement and the row update are inside the try, so a
+        # failure of either leaves the return value and the persisted row
+        # agreeing on False. Reporting True while the row says False would be a
+        # worse outcome than either being wrong.
+        print(f"MMDSv2 enablement/record failed (runtime is uninvocable until "
+              f"remediated): {type(e).__name__}: {e}")
+        mmdsv2 = False
 
     # 5 ── verify, wrapped so it cannot throw
     try:
@@ -183,7 +241,28 @@ def ensure_mmdsv2(agent_runtime_id: str) -> bool:
         networkConfiguration=current["networkConfiguration"],
         metadataConfiguration={"requireMMDSV2": True},
     )
-    return True
+
+    # `return True` here was a claim, not an observation — the update call not
+    # raising is not evidence the property is in force. UpdateAgentRuntime is
+    # accepted asynchronously and moves the runtime to UPDATING, so the value
+    # is not yet effective when the call returns.
+    #
+    # Two consequences, both handled below.
+    #
+    # First, wait. Skipping the wait leaves the caller's smoke test running
+    # against a runtime in UPDATING, which fails for a reason that has nothing
+    # to do with the agent — and fails silently, because a failing smoke test is
+    # non-fatal by design and so produces no signal anyone chases.
+    wait_until_ready(agent_runtime_id)
+
+    # Second, re-read and return what the control plane reports, not what we
+    # asked it for. An unverified True propagates into mmdsV2Enabled on the
+    # persisted row, which is the platform's own answer to "can this runtime be
+    # invoked" — a false yes there is the same defect as returning a placeholder
+    # shaped like data (see examples/output_validation.py).
+    confirmed = agentcore.get_agent_runtime(agentRuntimeId=agent_runtime_id)
+    return (confirmed.get("metadataConfiguration", {})
+            .get("requireMMDSV2") is True)
 
 
 def _runtime_name(tenant_id: str) -> str:

@@ -1,6 +1,6 @@
 ---
 name: agentcore-compliance-ops
-description: Design, build, review and debug AI agents on Amazon Bedrock AgentCore for regulated financial-crime compliance operations — alert triage, case investigation, SAR narrative drafting, transaction monitoring, customer risk assessment, ongoing and enhanced due diligence, QA sampling and fraud detection. Use whenever a prompt puts an AI agent near a supervised compliance decision — where AI may sit in a workflow, Harness vs Runtime, wiring agents to multi-tenant data without bypassing row-level security, human-in-the-loop and audit-record design, golden sets and evaluation, or model-risk governance. Also covers AgentCore platform problems outside compliance — execution-role IAM for inference profiles, service-linked roles, runtimeSessionId derivation and session isolation, Gateway targets and Cedar policy controls, quotas and throttling, MMDSv2, and per-tenant cost attribution. Not needed for AML questions with no AI component, or for agent platforms other than AgentCore.
+description: Design, build, review and debug AI agents on Amazon Bedrock AgentCore for regulated financial-crime compliance — alert triage, case investigation, SAR narrative drafting, transaction monitoring, customer risk assessment, due-diligence review, QA sampling and fraud detection. Use whenever a prompt puts an AI agent near a supervised compliance decision — where AI may sit in a workflow, Harness vs Runtime, wiring agents to multi-tenant data without bypassing row-level security, human-in-the-loop and audit-trail design, golden sets and evaluation, or model-risk governance. Also covers the AgentCore failures that silently break those controls — execution-role IAM for inference profiles, session isolation, Gateway tool namespacing, Cedar enforcement, MMDSv2, reasoning-trace capture and per-tenant cost attribution. For general Bedrock work with no compliance dimension, prefer the first-party amazon-bedrock skill. Not for AML questions with no AI component, or non-AgentCore agent platforms.
 ---
 
 # AI agents for compliance operations on AgentCore
@@ -24,7 +24,7 @@ Each corresponds to a real failure. They are structural properties, not preferen
 
 **No disposition authority.** An agent must be structurally incapable of closing an alert, filing a
 report, changing a risk rating or deploying a rule. Model output and human decision are separate
-types with no code path converting one to the other. `references/guardrails.md` is the full control
+types with no code path converting one to the other. `references/control-stack.md` is the full control
 stack; read it before designing any workflow that touches a decision.
 
 **Validate the payload before it reaches the agent loop.** An entrypoint payload is parsed from
@@ -38,6 +38,23 @@ between a control and the appearance of one.
 row-level security, per-tenant decryption and the audit trail. Route agent reads through the same
 authenticated API a customer integration would use, so isolation and audit are inherited rather
 than reimplemented. See `references/deployment-patterns.md`.
+
+**Decide what the cloud provider's logs are allowed to hold, and enforce it with a gate.** These are
+two different artefacts, not one record in two places. The provider-side log holds usage telemetry —
+workflow name, invocation counts, tool names, the row UUIDs read as references, tokens, cost, latency,
+enum and numeric output fields, and a content hash. The examinable record — reasoning trace, narrative
+output, retrieved evidence — belongs in your own store, encrypted under a tenant-scoped key.
+
+A compliance output carries PII by construction: `rationale`, `red_flags[].statement` and `gaps` are
+prose about a named person's transactions. So "the output JSON has no PII" cannot hold for the whole
+output, and it cannot be secured by instructing the model — that is a prompt instruction, not a
+control. Split the output with a deterministic **allowlist** gate (UUID, enum, number, boolean, hash;
+anything else diverts to the internal record) so a new schema field fails closed rather than leaking on
+its first deploy. Two corollaries people get wrong: Bedrock model invocation logging and AgentCore
+`APPLICATION_LOGS` both capture payloads verbatim, so in production they are **off**, not configured
+carefully; and a record that is only *hashed* under a tenant key satisfies tamper evidence and fails
+retrievability — you cannot show an examiner a hash, so encrypt for retrieval and hash for indexing.
+`references/audit-trail.md` and `examples/log_projection.py`.
 
 **Session IDs are server-derived.** AgentCore validates a session ID's format but does not verify
 it belongs to the caller. Where one backend principal invokes for many tenants, accepting a
@@ -53,8 +70,10 @@ an instance are not isolated from each other, so confirm which one you are on be
 `InferenceConfiguration` carries four members — `maxTokens`, `stopSequences`, `temperature`,
 `topP` — and frameworks drop the ones you leave unset, so the vendor's default applies and a
 model-ID swap silently changes sampling behaviour alongside prompt behaviour. Unset `maxTokens`
-also over-reserves quota (`input_tokens + max_tokens`), throttling you at a fraction of apparent
-capacity. There is no seed: **temperature 0 is greedy decoding, not a replayable run.** Pin the
+also over-reserves quota — reservation is the input tokens plus `max_tokens`, and settlement applies
+a per-model-family burndown multiplier to output tokens, so on some Claude generations one output
+token costs several quota tokens — throttling you at a fraction of apparent capacity. There is no
+seed: **temperature 0 is greedy decoding, not a replayable run.** Pin the
 parameters per workflow and record them with the model ID on the decision record —
 reconstructability comes from the record and the deterministic post-generation layer, never from
 expecting the model to repeat itself. `references/production-rules.md` §8 and §24.
@@ -70,7 +89,9 @@ usage event.
 | The task | Read first |
 |---|---|
 | Deciding which workflows to build, and in what order | `references/workflow-catalog.md` |
-| Human-in-the-loop, audit records, model-risk controls — **required** before any workflow whose output influences a decision | `references/guardrails.md` |
+| Human-in-the-loop, audit records, model-risk controls — **required** before any workflow whose output influences a decision | `references/control-stack.md` |
+| Capturing the reasoning trace, references used and per-fact attribution so a decision survives an examination — retention, PII masking, WORM evidence, tamper evidence | `references/audit-trail.md` |
+| The agent retrieves its own evidence through scope-restricted tools rather than receiving it in the prompt — tenant and customer scoping, required-retrieval sets, template injection points, and why this changes how you evaluate | `references/scoped-retrieval.md` |
 | Harness vs Runtime, tenant data access, session binding, deployment topology | `references/deployment-patterns.md` |
 | Writing or reviewing AgentCore infrastructure — **required**; catalogues defects that fail silently or blame the wrong cause | `references/production-rules.md` |
 | Choosing an IaC flavour, or hardening one | `references/iac-hardening.md` |
@@ -90,6 +111,12 @@ the comment before removing one.
 | `examples/tenant_isolation.py` | Server-derived, tenant-namespaced session IDs; tenant resolved from the resource |
 | `examples/output_validation.py` | Schema validation, categorical blocks, consistency and citation checks, tool-call errors that raise instead of returning placeholders, deterministic fail-safe routing |
 | `examples/cost_tracking.py` | Per-model rate table with prefix stripping, per-record cost, the projection that must reach the client |
+| `examples/log_projection.py` | The allowlist gate splitting one output into an AWS-safe metering projection and the tenant-encrypted internal record; HMAC content hash pairing the two; dev profile that must assert its data is synthetic |
+| `examples/audit_record.py` | The per-invocation decision record; bundle-to-Object-Lock then row, never the reverse; HMAC-over-digest pairing; `ListObjectVersions` verification; the append-only trigger DDL |
+| `examples/human_approval_gate.py` | Proposal and Decision as separate types with no converting function; idempotent approval, evidence-hash recheck, expiry, entitlement, four-eyes; graph validation rejecting an AI node that reaches a decision without a human gate |
+| `examples/action_reconciliation.py` | Asserted-versus-actual writes, four verdicts including *recorded but not invoked*; asserts invocation **count** so a double-write is caught; a missing log group as proof of non-invocation |
+| `examples/harness_config.py` | The Harness path the skill recommends and never showed — `bedrockModelConfig` flat shape, list-valued `systemPrompt`, and the override-stripping request builder that keeps `tools`/`skills`/`actorId` out of caller reach |
+| `examples/evaluation_harness.py` | Golden-set runner with tier 1 (evidence supplied) and tier 2 (evidence retrieved) held apart; retrieval coverage, over-reach and undeclared gaps graded separately; bias pairs excluded when an arm fails schema |
 | `examples/deployment_orchestration.py` | Create → ready → **persist** → verify ordering, placeholder assertion, MMDSv2 |
 | `examples/cedar_policies.md` | Read-only enforcement, tenant scoping, thresholds, temporal policies for cumulative exposure and cross-call provenance |
 | `examples/alert_triage_prompt.md` | Worked system prompt and schema, with observed failure modes |
@@ -136,6 +163,18 @@ Weigh this: three of the defects in `references/production-rules.md` — the mod
 object (§3), unset max output tokens (§8) and placeholder substitution (§5) — are "you own the
 loop" defects a managed loop cannot have.
 
+**And weigh this against it.** Harness moves configuration out of a deploy-time artefact and into a
+per-request field: `InvokeHarness` can override `model`, `systemPrompt`, `tools`, `allowedTools`,
+`skills`, `maxIterations`, `maxTokens`, `timeoutSeconds` and `actorId` for a single call. That is what
+makes it fast to iterate, and it is also the whole security review — because four of the controls
+above stop holding if caller input reaches `InvokeHarness` unfiltered. The tool list stops being the
+bypass-free control, `skills` injects trusted context including any scripts it carries and has no IAM
+condition key to restrain it, a caller-chosen `actorId` reads another actor's memory, and the model
+and prompt on the decision record become caller-chosen. Your backend constructs that request and
+**strips** every override field, allowlisting back only what a caller has a stated reason to set.
+Choosing Harness buys operational simplicity, not containment. `references/deployment-patterns.md`
+has the field-by-field consequences and the IAM the harness path needs.
+
 ---
 
 ## Verify, don't recall
@@ -144,10 +183,24 @@ AgentCore moves quickly — model IDs, quota values, API shapes, service names a
 all change, and confidently wrong infrastructure code is expensive to unwind. The reference files
 here hold distilled patterns, deliberately not volatile API detail.
 
+- **First, check whether the first-party `amazon-bedrock` skill is installed** (`~/.claude/skills/amazon-bedrock/`
+  or as a plugin skill). It is AWS's own guidance and it is the authority for everything Bedrock-side —
+  model IDs and inference-profile shapes, quota and burndown mechanics, prompt caching, cost
+  attribution, Guardrails configuration, Claude generation migration, and the AgentCore
+  Runtime/Harness/Gateway/Memory API surface. Read it before WebFetching and prefer it over anything
+  recalled. This skill is the compliance layer on top of it: where the two disagree on a platform
+  detail, the AWS skill wins; where they disagree on how a control must be built for a supervised
+  compliance decision, this one does. Two known exceptions where this skill is currently more
+  specific — the MMDSv2 update step, which that skill's Runtime deployment walkthrough omits, and
+  Cedar/Dogwood policy detail, which it defers to live docs.
 - **Check the current API surface against live AWS documentation before generating code.** Prefer
   an AWS documentation MCP if one is available (search/read documentation tools, loaded via
   ToolSearch — the exact tool prefix varies by installation); otherwise WebFetch the pages below.
   With neither, say plainly that your AgentCore specifics are unverified.
+- **Treat `get-foundation-model-availability` as necessary, not sufficient.** AWS documents its four
+  fields and their enum values and nothing more — no page defines their operational meaning or claims
+  any of them predicts whether an invoke will succeed, and all four can read AVAILABLE/AUTHORIZED
+  while `InvokeModel` returns `AccessDeniedException`. Prove access with a real one-token invoke.
 - **Read the account's actual state** rather than assuming defaults: `list-inference-profiles`,
   `get-service-quota`, `get-foundation-model-availability`, `get-agent-runtime`.
 
@@ -168,7 +221,7 @@ Canonical starting points, all under `https://docs.aws.amazon.com`:
 
 ## Anti-patterns
 
-`references/guardrails.md` covers the design-level ones. These are the platform-level ones.
+`references/control-stack.md` covers the design-level ones. These are the platform-level ones.
 
 | Anti-pattern | Why it fails |
 |---|---|
@@ -180,6 +233,15 @@ Canonical starting points, all under `https://docs.aws.amazon.com`:
 | Cedar policy without restricting direct Runtime invocation | Policy only sees traffic that flows through the Gateway |
 | Confidence score as an approval gate | Confidence is not calibrated to correctness |
 | Shipping without a golden set | Degradation is invisible until an examiner finds it |
+| Caller-supplied `InvokeHarness` fields passed through | Overrides `tools`, `skills` and `actorId` — arbitrary code and another actor's memory |
+| Bedrock Guardrails attached but not IAM-enforced | A caller that omits `guardrailConfig` gets no guardrail and no error |
+| Treating a policy-denial message as proof the rule fired | Default-deny emits the same message when nothing matched |
+| OTEL trace store as the audit record | X-Ray retention is 30 days and not configurable |
+| Data-protection policy added after go-live | Masking applies at ingestion, so everything already logged stays in the clear |
+| Prompt tells the model to keep PII out of its output | A prompt instruction is not a control; the gate has to be deterministic |
+| Denylist of PII-shaped field names before logging | A new schema field leaks on its first deploy; allowlist fails closed |
+| Reasoning trace stored only as a hash under the tenant key | Tamper evidence without retrievability — an examiner cannot be shown a hash |
+| Model invocation logging left enabled in production | Captures full prompts and completions verbatim, account-and-Region-wide |
 
 ---
 

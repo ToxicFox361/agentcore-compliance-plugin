@@ -131,7 +131,7 @@ separate action-capable agent — invoked only after human approval — that fil
 escalates. Per-agent budgets generalise to per-case action limits.
 
 This is the cleanest expression of segregation of duties available in an agent architecture, and it
-is what `guardrails.md` Layer 1 looks like when implemented rather than asserted. The capability
+is what `control-stack.md` Layer 1 looks like when implemented rather than asserted. The capability
 split must be real: separate execution roles, separate tool lists, separate Gateways or targets.
 
 ---
@@ -153,6 +153,41 @@ caller's scopes with a per-target allowance, so a profile specialist can only ev
 claim then record who delegated what to whom. AgentCore Identity provides the inbound authorizer,
 the credential providers and the on-behalf-of token-exchange grant this pattern needs —
 [AgentCore Identity](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/identity.html).
+
+**Name the mechanism.** The parameter that carries a person rather than a service is
+**`runtimeUserId`**, accepted by both `InvokeAgentRuntime` and `InvokeHarness` and travelling as
+`X-Amzn-Bedrock-AgentCore-Runtime-User-Id`. Using it is itself an IAM-visible act: invoking on behalf
+of a user requires `bedrock-agentcore:InvokeAgentRuntimeForUser` *in addition to*
+`bedrock-agentcore:InvokeAgentRuntime`, so "which principals may act for a named user" becomes a
+policy question with a written answer.
+
+**Then know what the platform does not verify.** That header is enough to reach the user-scoped
+credential path — AgentCore resolves it through `GetWorkloadAccessTokenForUserId` for on-behalf-of
+OAuth flows. But the platform treats the user ID as **an opaque string, and does not verify it
+against an authenticated end-user identity**; the binding holds only because the calling workload
+passed the right value and your IAM scoping is tight. Only the JWT inbound path validates a real
+end-user token, which is why AWS recommends JWT bearer authentication for production deployments and
+why on-behalf-of exchange presumes an inbound user token to exchange in the first place. A runtime
+supports one inbound method at a time — separate versions for different authentication types — so
+this is a design-time decision with a version change behind it, not a runtime toggle.
+
+The consequence for a compliance platform is concrete. If the audit trail must name a person, either
+put a validated JWT on the inbound path, or derive `runtimeUserId` server-side from the authenticated
+principal and never from a request body — the identical argument this skill makes about session IDs
+(`production-rules.md` §7). AWS's own guidance supplies the detection half: monitor
+`GetWorkloadAccessTokenForUserId` in CloudTrail for unexpected user IDs.
+
+**Be precise about what Identity evidences.** Identity operations are CloudTrail-logged with token
+values redacted — AWS's examples show `HIDDEN_DUE_TO_SECURITY_REASONS` where the workload access
+token would be — so an exchange is recorded without the credential entering the log. Tokens are
+scoped to a specific user-and-agent pair, so credentials held for one user cannot serve another
+user's request, which is the binding this whole pattern exists to create. What none of it proves is
+that a qualified person read a draft and approved it. That record is yours to build (pattern 7, and
+`control-stack.md`).
+
+- [Authenticate and authorize inbound requests](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-oauth.html)
+- [Get a workload access token](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/get-workload-access-token.html)
+- [Runtime security best practices](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-security-best-practices.html)
 
 **Check before copying:** whether the chain actually carries the user's identity or merely starts
 with it. And treat any approval gate in such a sample as prompt-level unless you can point at the
@@ -187,10 +222,64 @@ APPROVED | REJECTED`.
 Two distinct uses:
 
 - **Change control for the platform itself.** A new agent, prompt or schema version passes automated
-  scanning plus human sign-off before it goes live. `guardrails.md` (model risk governance) requires
+  scanning plus human sign-off before it goes live. `control-stack.md` (model risk governance) requires
   this; the state machine is how it is implemented.
 - **Decision approval.** The same states map onto a SAR: auto-drafted → pending compliance-officer
   approval → filed or rejected.
+
+**Do not hand-build the first one.** AWS Agent Registry — documented inside the AgentCore guide —
+ships this state machine with the same state names: `DRAFT → PENDING_APPROVAL → APPROVED`, with
+`REJECTED` reachable from pending and `DEPRECATED` terminal from any status. It also ships the parts
+that take longest to build by hand:
+
+- **Publisher and curator as distinct personas with distinct IAM permissions** — the maker-checker
+  split enforced rather than described. The curator's `UpdateRegistryRecordStatus` call requires a
+  `statusReason`, so the reason for a rejection is a mandatory field rather than one you remember to
+  add.
+- **A dual-revision rule.** Editing an approved record opens a new draft while the approved revision
+  stays discoverable until a curator approves its replacement. That is the "pin a version, repoint an
+  endpoint" change-control shape the skill already recommends, applied to the catalogue entry.
+- **Records with structure.** `recordType` (`MCP`, `AGENT`, `SKILL`, `CUSTOM`), display name,
+  description, version and tags, with endpoint and capability detail inside a descriptor that AWS
+  validates against the MCP or agent protocol schema. Endpoint is not a top-level field — it lives in
+  the descriptor payload.
+- **EventBridge on submission and CloudTrail on the governance calls.** Record creation, submission
+  and approval are management events, logged by default: who registered and who approved are
+  answerable without extra work. Note the asymmetry — *discovery* and MCP invocation are **data
+  events and are not logged by default**, so "who found and used this agent" needs data-event logging
+  enabled for the registry resource type before it becomes an answerable question.
+
+For the **agent inventory** `control-stack.md` requires — each agent a registered model with an owner,
+purpose and risk tier — that is a better answer than a table you maintain yourself.
+
+Three things to settle before an examinable control depends on it:
+
+- **Auto-approval is pattern 3's inverted flag in different clothes.** Manual review is the default;
+  configuring an auto-approval rule makes submission skip `PENDING_APPROVAL` and land on `APPROVED`,
+  which is no gate at all. AWS does not say where auto-approval is acceptable, so make the ruling
+  yourself: isolated development accounts only, and its presence in a registry that describes
+  production agents is a finding.
+- **It is a Preview feature in a subset of Regions.** Confirm availability, and what the Preview
+  service terms mean for a regulated workload, before it carries a control you would show an examiner.
+- **The namespace has already moved, with a hard cutoff.** The registry now lives under
+  `agent-registry` rather than `bedrock-agentcore`; the preview namespace shuts down on AWS's
+  published date (September 17, 2026 as written), after which access to it and to any data left in it
+  is gone. Endpoints, IAM action prefix, service principal, ARNs, CLI, SDK client, CloudTrail event
+  source, EventBridge source, CloudWatch namespace and Service Quotas code all change, a new
+  `AgentRegistryFullAccess` managed policy replaces the old one (which will *not* be updated), records
+  are not migrated for you, and the schema changes are breaking. The trap worth naming: the move
+  applies to the registry *only* — Identity, Gateway, Runtime and Policy stay where they are — so a
+  blanket search-and-replace across your IAM policies breaks workload-identity and OAuth
+  credential-provider permissions, which remain under `bedrock-agentcore`.
+
+- [AWS Agent Registry](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/registry.html)
+- [Record lifecycle](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/registry-record-lifecycle.html)
+- [Registry migration guide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/registry-faq.html)
+- [Log Registry API calls with CloudTrail](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/registry-cloudtrail.html)
+
+**Then spend the effort you saved on the half it does not cover.** Registry approves a registered
+*resource*; nothing in it approves a *case decision*. A four-eyes gate on a SAR narrative or an alert
+disposition is still yours to build, and that is where the design attention belongs.
 
 The property to preserve is that the draft and the decision are **separate records with separate
 authorship**, not one record whose status field advances. That is what makes the maker-checker split
@@ -330,16 +419,59 @@ which also records the attribute-naming defect that causes this silently.
 
 ## 13. PII-safe, tenant-tagged observability
 
-Three mechanisms, used together, are what let you keep traces at all in a platform handling customer
-data:
+**The strongest control is not emitting it.** Every mechanism below is about narrowing PII that has
+already reached telemetry, and each is weaker than the decision not to put it there — so make that
+decision first and explicitly: which fields may leave the process at all, enforced by a deterministic
+allowlist rather than by the model's cooperation or a reviewer's attention. Where the deployment policy
+is that the provider's logs hold usage telemetry only, this pattern's job shrinks to defence-in-depth
+for the leakage that happens anyway, which is the right size for it. `examples/log_projection.py` has
+the gate; `audit-trail.md` has the profile split.
+
+Three mechanisms, used together, are what let you keep traces at all once something does flow:
 
 - **Redaction before export.** A span processor that strips configured attributes — prompt bodies,
   input messages — before telemetry leaves the process. Redaction after export is not redaction.
-- **Anonymisation in the data path.** Guardrails masking PII in prompts and responses, plus log
-  data-protection policies masking PII in application logs.
+- **The log estate treated as the primary PII sink.** The mechanism teams reach for here does not
+  reach as far as its name suggests. Guardrails PII masking covers what the model is sent and what it
+  returns — and explicitly **not** the invocation logs: AWS states that the `input` field in
+  CloudWatch Logs *always* contains the original, unmodified request regardless of guardrail
+  intervention, and points at log data protection as the answer. So wherever Bedrock invocation
+  logging is enabled, card numbers and national IDs land in the log estate in clear text however the
+  guardrail is configured. Two edges push the same way: masking is unsupported in asynchronous
+  streaming mode, and with the guardrail trace enabled the detected entity's `match` field carries
+  the *original* PII value by design, so whatever persists that trace persists the PII. Masking
+  narrows what a caller and a reviewer see; redaction before export and a log data-protection policy
+  are what narrow the estate — complements to each other, not duplicates. `audit-trail.md` has the
+  mechanisms.
 - **Tenant correlation without identity leakage.** Propagate a tenant identifier and session
   identifier onto every child span via context baggage, while explicitly *not* propagating the
   user's email or name. You get per-tenant trace correlation without putting a person in the trace.
+  The headers and parameters that carry this are named in "What a trace can attribute" below —
+  "propagate context" is not implementable until you know which ones.
+
+**A data-protection policy is not retroactive, so it belongs in the log group's definition.**
+CloudWatch Logs masks at *ingestion*: AWS is explicit that log events ingested into the log group
+before the policy existed are not masked. Turn it on after the agent has been running and every
+prompt, tool argument and reasoning trace already ingested stays in the clear permanently, for the
+life of the group — and in a regulated deployment the long retention that protects your evidence is
+the same retention that preserves that exposure. This makes it a deployment-ordering rule rather
+than a security-review one: the policy is created **with** the log group, in the same template,
+before the first invocation.
+
+Masking is not destroying the evidence, and it is worth naming the read-back path before someone
+argues that it is. A principal holding `logs:Unmask` can read the originals — the `unmask` command
+in Logs Insights, or `unmask=true` on `GetLogEvents` and `FilterLogEvents`. Grant it to exactly one
+break-glass role and alarm on its use, which turns "who read raw customer data" into a question with
+an answer. One interaction to check before it is needed: the Infrequent Access log class can *mask*
+but cannot *unmask* — the `unmask` query command is unsupported there, and `GetLogEvents` and
+`FilterLogEvents` are not available for IA log groups at all — so applying that cost optimisation to
+a group holding masked evidence quietly removes the break-glass path. `audit-trail.md` §4 has the
+policy document and the break-glass role; this pattern only decides that you need them.
+
+- [Remove PII with sensitive information filters](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-sensitive-filters.html)
+- [Monitor model invocation with logging](https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html)
+- [Help protect sensitive log data with masking](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/mask-sensitive-log-data.html)
+- [CloudWatch Logs log classes](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatch_Logs_Log_Classes.html)
 
 AgentCore emits OpenTelemetry-compatible telemetry into CloudWatch, so the standard OTel
 instrumentation hooks apply —
@@ -367,6 +499,105 @@ offered at all, and servers should fall back safely when it is absent —
 
 Use it as the last mile of a human-in-the-loop design, not as a replacement for one: it confirms an
 action, it does not create an approval record.
+
+---
+
+## What a trace can attribute, and what it cannot
+
+Per-fact attribution is yours to build (`control-stack.md`, and `production-rules.md` §25). The reason
+is structural rather than a gap someone will close in a future release, and knowing which half is
+which saves a team a quarter spent trying to make spans carry evidence.
+
+**The carriers, first.** "Propagate trace context across every agent boundary" is not implementable
+until you know what to put where. The supported invoke headers are:
+
+| Header | Carries |
+|---|---|
+| `X-Amzn-Trace-Id` | X-Ray context — `Root=1-…;Parent=…;Sampled=1` |
+| `traceparent` | W3C context — `00-<32hex>-<16hex>-01` |
+| `tracestate` | vendor state travelling with `traceparent` |
+| `baggage` | your own key/values — tenant, case ID |
+| `X-Amzn-Bedrock-AgentCore-Runtime-Session-Id` | the runtime session |
+| `mcp-session-id` | the MCP session |
+
+`InvokeAgentRuntime` also accepts `traceId`, `traceParent`, `traceState`, `baggage`,
+`runtimeSessionId` and `runtimeUserId` as request parameters, and **returns the trace identifiers in
+the response.** That return is the part worth designing around: the caller can pin the trace ID onto
+the decision record at invocation time instead of reconstructing the join later from timestamps. Two
+details that bite in practice — `InvokeHarness` takes the same parameters but returns an event stream
+and **not** the trace headers, so on the Harness path the caller supplies the trace ID rather than
+learning it; and `runtimeSessionId` has a **minimum length of 33**, which quietly rejects a 32-hex
+digest as a session ID (`production-rules.md` §7).
+
+One security caveat, the same argument this skill makes about session IDs
+(`production-rules.md` §7): **a trace ID arriving from a tenant-facing API is a correlation hint,
+never an identity.** A caller can inject any trace ID and any sampling decision, so derive it
+server-side and treat an inbound one as untrusted input.
+
+**What tracing genuinely gives you:**
+
+- A real parent/child hierarchy across agent boundaries — *if* you propagate. Unpropagated, a
+  request through five agents is five disconnected traces.
+- Span classification via `gen_ai.operation.name`. **AgentCore itself recognises three values** —
+  `invoke_agent`, `execute_tool` and `chat` — and the documented fallback for an inference span is
+  `llm.request.type` = `chat`, with `openinference.span.kind` for OpenInference-instrumented
+  frameworks. The wider OTel vocabulary (`create_agent`, `text_completion`, `embeddings`,
+  `retrieval`, `generate_content`) is valid upstream but buys nothing here, because AgentCore will not
+  classify on it. Emit the three it reads and put anything finer in your own namespace.
+  `references/audit-trail.md` has the full span design.
+- Session-to-trace joining via `session.id`, which the inbound
+  `X-Amzn-Bedrock-AgentCore-Runtime-Session-Id` header maps onto and which you propagate to child
+  spans through OTEL baggage. Note that AgentCore's own `InvokeAgentRuntime` span carries `aws.*`
+  names — `aws.operation.name`, `aws.resource.arn`, `aws.request_id`, `aws.agent.id`,
+  `aws.endpoint.name`, `aws.account.id`, `aws.region`, `latency_ms`, `error_type` (one of `throttle`,
+  `system`, `user`) — rather than `gen_ai.*`, so a query written against one vocabulary silently
+  misses the other.
+
+**What it structurally cannot do:**
+
+- **A span is an interval; a fact is not.** Spans model work that started and ended. No span shape
+  has one-per-asserted-fact cardinality, so "which specialist asserted this sentence" is not a
+  question the trace model can be bent into answering.
+- **Indexed annotations are capped at 50 per trace, and the quota is not adjustable.** Annotations
+  are the only span fields X-Ray indexes for filter expressions; beyond 50 there is no searchability
+  to rely on. And in the OTEL→X-Ray path every span attribute lands as unindexed **metadata** unless
+  its key appears in the span's `aws.xray.annotations` attribute — a list of other attribute keys, not
+  a collector setting. So you cannot make N facts filterable for any realistic N.
+- **Size.** An X-Ray segment document is capped at 64 KB, and the log event you would use to carry
+  the overflow at 1 MB. A specialist's evidence set for one case routinely exceeds both, so the trace
+  can hold a pointer to the evidence but not the evidence.
+- **Retention.** X-Ray traces are kept **30 days, not configurable.** Compliance retention is
+  measured in years.
+- **A specialist that never ran emits no span.** Absence is exactly as invisible in the trace as it
+  is in the synthesiser's input (`production-rules.md` §25) — and sampling can remove a span that
+  *did* run — which is why the dispatch manifest is not made redundant by good tracing. One fix worth
+  adopting anyway: open the child span **at dispatch, before the call**, so a specialist that never
+  returns still leaves a span with an error status. Silence becomes a record.
+
+Two design rules follow, and both are cheap to adopt on day one and expensive to retrofit:
+
+- **Put your own attributes in your own namespace** — `compliance.case.id`,
+  `compliance.specialist.id`, `compliance.workflow.version`. Never invent a `gen_ai.*` key: a future
+  convention release can redefine it underneath you and silently change what your query means, and
+  nobody issues deprecation notices for a key you made up.
+- **Pin the semantic-convention version and record it on the decision record.** These keys move:
+  `gen_ai.prompt` and `gen_ai.completion` have been deprecated upstream in favour of
+  `gen_ai.input.messages` and `gen_ai.output.messages`, and AgentCore's per-framework pages document
+  several vocabularies live at once — `gen_ai.*`, `traceloop.entity.input`/`output`, OpenInference's
+  `llm.input_messages.*`. A stored trace is only interpretable against the convention in force when it
+  was produced, which is the same argument this skill makes for output schemas and model IDs.
+
+And one attribute set to leave off deliberately: keep `gen_ai.input.messages` and
+`gen_ai.output.messages` **off** spans in a compliance deployment. They carry customer PII verbatim
+into the store you have least control over — one you cannot make immutable, cannot retain to your own
+policy, and cannot key per subject when an erasure request arrives. Message content belongs on the
+decision record or nowhere.
+
+- [Configure observability and propagate context](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html)
+- [InvokeAgentRuntime](https://docs.aws.amazon.com/bedrock-agentcore/latest/APIReference/API_InvokeAgentRuntime.html)
+- [Runtime spans and metrics](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-runtime-metrics.html)
+- [X-Ray segment documents](https://docs.aws.amazon.com/xray/latest/devguide/xray-api-segmentdocuments.html)
+  and [X-Ray quotas](https://docs.aws.amazon.com/general/latest/gr/xray.html)
 
 ---
 
@@ -408,7 +639,7 @@ undetected.
 Gaps that are consistently yours to build, whatever you start from:
 
 - **An immutable / WORM audit log.** Traces and application tables are mutable. Nothing in a typical
-  sample tree gives you a tamper-evident decision record. `guardrails.md` specifies what to persist;
+  sample tree gives you a tamper-evident decision record. `control-stack.md` specifies what to persist;
   the append-only store underneath it is your build.
 - **A composed multi-tenant platform.** The primitives are strong and available — IAM-scoped actor
   identity, namespace conventions, per-tenant keys, tenant-tagged traces — but assembling them into a
@@ -420,6 +651,14 @@ Gaps that are consistently yours to build, whatever you start from:
   humans, two timestamps, one immutable outcome — is not something you will find pre-built.
 - **Evidence that the agent did what it said.** Verifying a claimed action against invocation
   metrics (`production-rules.md` §18) is a check you have to write.
+- **Per-fact attribution across a multi-agent merge.** Not a gap in the samples but a limit of the
+  telemetry model — "What a trace can attribute" above gives the reasons, and they do not change with
+  better instrumentation.
+
+One item has left this list: the **agent inventory** is now a managed catalogue with an approval
+workflow rather than a table you maintain (pattern 7), Preview caveats and namespace migration
+included. Note precisely what that did *not* close — it approves a registered resource, not a case
+decision, so the four-eyes gate above stays yours.
 
 The primitives and most of the mechanics are available. The audit layer, the tenancy composition and
 the attribution checks are the parts you own.

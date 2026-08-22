@@ -82,12 +82,40 @@ def agent_execution_role(scope: Construct, region: str, *,
                         f"arn:aws:logs:{region}:{account_id}:log-group:/aws/bedrock-agentcore/*"
                     ],
                 ),
+                # CloudWatch namespaces are CASE-SENSITIVE, and AWS's own docs
+                # disagree about this one across three pages: the AgentCore
+                # observability guide gives `bedrock-agentcore`, others give
+                # `Bedrock-AgentCore` and `Bedrock-Agentcore`. AWS's instruction
+                # is to DISCOVER the value rather than copy it, which is the
+                # tell that the published value is not reliable.
+                #
+                # The failure mode: a StringEquals on the wrong casing denies
+                # PutMetricData SILENTLY. The agent raises nothing — the call is
+                # made by the ADOT layer, which swallows the denial — and the
+                # metric simply never appears. The visible symptom is "metrics
+                # are not wired up", so the debugging goes into instrumentation
+                # rather than into a condition key, and this is a hard defect to
+                # find twice because the first time nobody wrote it down.
+                #
+                # `?` matches exactly one character in StringLike, so the
+                # pattern below tolerates all three documented casings without
+                # widening the grant to arbitrary namespaces.
+                #
+                # Discovery — run all three against your own region; only one
+                # returns metrics, and record the date you checked:
+                #   aws cloudwatch list-metrics --namespace "bedrock-agentcore"
+                #   aws cloudwatch list-metrics --namespace "Bedrock-AgentCore"
+                #   aws cloudwatch list-metrics --namespace "Bedrock-Agentcore"
+                # Checked 2026-08-17: the devguide observability page documents
+                # `bedrock-agentcore`. Verify in your account rather than
+                # inheriting that. Kept identical to examples/agent_runtime.tf —
+                # two examples disagreeing on a control is its own defect.
                 iam.PolicyStatement(
                     effect=iam.Effect.ALLOW,
                     actions=["cloudwatch:PutMetricData"],
                     resources=["*"],
-                    conditions={"StringEquals": {
-                        "cloudwatch:namespace": "bedrock-agentcore"
+                    conditions={"StringLike": {
+                        "cloudwatch:namespace": "?edrock-?gent?ore"
                     }},
                 ),
                 iam.PolicyStatement(
@@ -98,13 +126,24 @@ def agent_execution_role(scope: Construct, region: str, *,
                 ),
 
                 # ── Workload identity ────────────────────────────────────────
+                # BOTH ARNs. AWS's own service-linked-role policy grants the
+                # directory resource as well as the workload identities under
+                # it, and the token calls are authorized against both — so the
+                # narrower list looks correct and fails with
+                # AccessDeniedException on a call that names neither ARN in its
+                # message. examples/agent_runtime.tf already listed both; this
+                # file listed only the second, which is worse than either being
+                # wrong consistently: whichever example a reader copies, the
+                # other one silently contradicts it.
                 iam.PolicyStatement(
                     effect=iam.Effect.ALLOW,
                     actions=["bedrock-agentcore:GetWorkloadAccessToken",
                              "bedrock-agentcore:GetWorkloadAccessTokenForJWT"],
                     resources=[
                         f"arn:aws:bedrock-agentcore:{region}:{account_id}"
-                        f":workload-identity-directory/default/workload-identity/*"
+                        f":workload-identity-directory/default",
+                        f"arn:aws:bedrock-agentcore:{region}:{account_id}"
+                        f":workload-identity-directory/default/workload-identity/*",
                     ],
                 ),
 

@@ -311,7 +311,8 @@ another.
 
 **Verified wiring, not reported status.** Before a workflow goes live, prove it does what the
 design claims by exercising it, in both directions — the permitted path succeeds, the forbidden
-path is refused. Resources reporting `READY`, `ACTIVE` or `ENFORCE` prove only that they loaded.
+path is refused. A runtime reporting `READY`, a Gateway target reporting `READY`, a policy engine
+reporting `ENFORCE` — each proves only that the resource loaded.
 This matters more here than in ordinary software because these workflows are defined as much by
 what the agent *cannot* do as by what it does: "the agent cannot close an alert" is a claim you
 will eventually have to evidence, and the only evidence is a recorded attempt that failed. Two
@@ -329,6 +330,33 @@ a rule. The tooling should make that structurally impossible, not merely discour
 **Model choice per workflow.** Enrichment and summarisation run fine on a small, cheap model.
 Triage and narrative drafting need a stronger one. Benchmark per workflow on identical fixtures —
 observed differences are large and not intuitable from benchmarks.
+
+**Service tier per workflow.** Bedrock's processing tiers are a per-request choice — `priority`,
+`default`, `flex` and `reserved`, sent as `serviceTier: {"type": ...}` on Converse or the
+`X-Amzn-Bedrock-Service-Tier` header on InvokeModel — and this catalogue is already sorted along the
+axis they key on: whether anyone is waiting for the answer.
+
+- **Real-time fraud decisioning (§7)** is the one workflow where latency is correctness, so it takes
+  `priority`, which is served ahead of standard and flex traffic for a price premium. And if a model
+  outage would mean a payment outage, evaluate `reserved`: it reserves input and output
+  tokens-per-minute for a one- or three-month term, overflows to standard when you exceed the
+  reservation, and is the only tier whose capacity sits outside the shared on-demand pool. It sits
+  alongside the deterministic fallback path rather than replacing it.
+- **Periodic ODD/EDD reviews (§6)** and **QA sampling (§9)** have nobody waiting, so they take
+  `flex`: discounted, and deprioritised behind standard traffic when the Region is busy. Longer
+  processing for less money is the right trade when the deadline is a day away rather than a second.
+  Where a sweep has no same-day deadline at all, batch inference is cheaper again — around half of
+  on-demand pricing on the models that offer it.
+- **Everything interactive** — triage (§1), enrichment (§2), the case copilot (§3) — stays on
+  `default`.
+
+One trap, because the intuition is natural and wrong: **moving the batch sweeps to `flex` does not
+buy the interactive workflows any quota headroom.** A model's on-demand quota is
+*shared* across `priority`, `default` and `flex`; only a `reserved` reservation sits outside it. Tier
+changes scheduling priority and price, not throughput allocation. When throttling is the actual
+problem the levers are batch inference (which does have its own quotas), cross-Region inference
+profiles, a quota increase, reserved capacity, and backoff — `production-rules.md` §8 and §10.
+See [Service tiers](https://docs.aws.amazon.com/bedrock/latest/userguide/service-tiers-inference.html).
 
 **Tenant isolation.** Every data access is scoped to one tenant and travels the platform's
 authenticated, audited path. See `deployment-patterns.md`.
